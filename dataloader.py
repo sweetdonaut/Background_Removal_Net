@@ -8,8 +8,12 @@ import tifffile
 from gaussian import (
     create_gaussian_defect,
     create_binary_mask,
-    apply_defect_to_background
+    apply_defect_to_background,
+    create_local_gaussian_defect,
+    apply_local_defect_to_background
 )
+from functools import lru_cache
+import psutil
 
 
 def calculate_positions(img_size, patch_size, min_patches=2):
@@ -48,21 +52,23 @@ class Dataset(Dataset):
     """
     
     def __init__(self, training_path, patch_size=(256, 256), 
-                 num_defects_range=(5, 15), defect_size_range=(3, 5),
-                 img_format='png', image_type='mvtec'):
+                 num_defects_range=(3, 8), defect_size_range=(3, 5),
+                 img_format='tiff', image_type='strip', cache_size=0):
         """
         Args:
             training_path: Path to training images (required)
             patch_size: Size of patches to extract (height, width)
-            num_defects_range: (min, max) number of defects
+            num_defects_range: (min, max) number of defects per patch (default 3-8)
             defect_size_range: Not used anymore, we use fixed 3x3 and 3x5
             img_format: Image format to load ('png_jpg' or 'tiff')
             image_type: Type of images ('strip', 'square', 'mvtec')
+            cache_size: Number of images to cache (0 = no cache)
         """
         self.patch_size = patch_size
         self.num_defects_range = num_defects_range
         self.img_format = img_format
         self.image_type = image_type
+        self.cache_size = cache_size
         
         # Warning for small defect numbers
         if num_defects_range[0] < 3:
@@ -86,13 +92,29 @@ class Dataset(Dataset):
         
         print(f"Found {len(self.training_paths)} training images")
         
-        # Pre-calculate all patches positions for all images
-        self.patches = []
-        self._prepare_patches()
+        # Setup image cache if requested
+        self._setup_cache()
+        
+        # Calculate patch positions once (not all combinations)
+        self._setup_patch_positions()
     
     
-    def _prepare_patches(self):
-        """Pre-calculate all valid patch positions for all images"""
+    def _setup_cache(self):
+        """Setup image cache"""
+        if self.cache_size > 0:
+            self._load_image = lru_cache(maxsize=self.cache_size)(self._load_image_uncached)
+        else:
+            self._load_image = self._load_image_uncached
+    
+    def _load_image_uncached(self, img_path):
+        """Load image without caching"""
+        if self.img_format == 'tiff':
+            return tifffile.imread(img_path)
+        else:
+            return cv2.imread(img_path)
+    
+    def _setup_patch_positions(self):
+        """Setup patch positions for dynamic calculation"""
         # Determine image size based on image_type
         if self.image_type == 'strip':
             img_h, img_w = 976, 176
@@ -104,70 +126,66 @@ class Dataset(Dataset):
         print(f"Using image size {img_h}x{img_w} for image_type: {self.image_type}")
         
         # Calculate positions for height and width
-        y_positions = calculate_positions(img_h, self.patch_size[0])
-        x_positions = calculate_positions(img_w, self.patch_size[1])
+        if self.image_type == 'strip':
+            # For strip images, use 9 patches in Y direction
+            self.y_positions = calculate_positions(img_h, self.patch_size[0], min_patches=9)
+        else:
+            self.y_positions = calculate_positions(img_h, self.patch_size[0])
+        self.x_positions = calculate_positions(img_w, self.patch_size[1])
         
-        if y_positions is None or x_positions is None:
+        if self.y_positions is None or self.x_positions is None:
             raise ValueError(f"Image size {img_h}x{img_w} is smaller than patch size {self.patch_size}")
         
-        print(f"Patch positions - Y: {len(y_positions)} positions {y_positions[:3]}{'...' if len(y_positions) > 3 else ''}")
-        print(f"Patch positions - X: {len(x_positions)} positions {x_positions[:3]}{'...' if len(x_positions) > 3 else ''}")
+        print(f"Patch positions - Y: {len(self.y_positions)} positions {self.y_positions[:3]}{'...' if len(self.y_positions) > 3 else ''}")
+        print(f"Patch positions - X: {len(self.x_positions)} positions {self.x_positions[:3]}{'...' if len(self.x_positions) > 3 else ''}")
         
-        # Generate patches for each image
-        for img_idx, img_path in enumerate(self.training_paths):
-            for y in y_positions:
-                for x in x_positions:
-                    self.patches.append({
-                        'img_idx': img_idx,
-                        'img_path': img_path,
-                        'y': y,
-                        'x': x
-                    })
+        # Calculate total patches info
+        self.patches_per_image = len(self.y_positions) * len(self.x_positions)
+        self.total_patches = len(self.training_paths) * self.patches_per_image
         
-        patches_per_image = len(y_positions) * len(x_positions)
-        print(f"Total patches: {len(self.patches)} ({patches_per_image} patches per image from {len(self.training_paths)} images)")
+        print(f"Total patches: {self.total_patches} ({self.patches_per_image} patches per image from {len(self.training_paths)} images)")
     
     def __len__(self):
-        return len(self.patches)
+        return self.total_patches
     
     def __getitem__(self, idx):
-        # Get patch info
-        patch_info = self.patches[idx]
-        img_path = patch_info['img_path']
-        start_y = patch_info['y']
-        start_x = patch_info['x']
+        # Dynamically calculate which image and patch position
+        img_idx = idx // self.patches_per_image
+        patch_idx = idx % self.patches_per_image
         
-        if self.img_format == 'tiff':
-            # Use tifffile for TIFF format
-            image = tifffile.imread(img_path)
-            # TIFF files should already be float32 in 0-255 range
-        else:
-            # Use cv2 for PNG/JPG
-            image = cv2.imread(img_path)
-            # Keep as uint8, will convert when normalizing
+        # Calculate patch coordinates
+        y_idx = patch_idx // len(self.x_positions)
+        x_idx = patch_idx % len(self.x_positions)
+        
+        # Get image path and patch positions
+        img_path = self.training_paths[img_idx]
+        start_y = self.y_positions[y_idx]
+        start_x = self.x_positions[x_idx]
+        
+        # Use cached or uncached loading
+        image = self._load_image(img_path)
         
         if image is None:
             raise ValueError(f"Failed to load image: {img_path}")
         
-        # Extract three channels from original image
-        target_channel = image[:, :, 0]
-        ref1_channel = image[:, :, 1]
-        ref2_channel = image[:, :, 2]
+        # Convert from CHW to HWC format for stripe dataset
+        if self.image_type == 'strip' and image.shape[0] == 3:
+            image = np.transpose(image, (1, 2, 0))
         
-        # Generate defects on the original image first
+        # Crop patch FIRST (key optimization)
+        end_y = start_y + self.patch_size[0]
+        end_x = start_x + self.patch_size[1]
+        patch = image[start_y:end_y, start_x:end_x]
+        
+        # Extract three channels from the patch
+        target_channel = patch[:, :, 0]
+        ref1_channel = patch[:, :, 1]
+        ref2_channel = patch[:, :, 2]
+        
+        # Generate defects directly on the patch (new strategy: 50% chance)
         target, ref1, ref2, gt_mask = self.generate_defect_images_on_channels(
             target_channel, ref1_channel, ref2_channel
         )
-        
-        # Use pre-calculated position to crop
-        end_y = start_y + self.patch_size[0]
-        end_x = start_x + self.patch_size[1]
-        
-        # Crop all channels and mask at the pre-determined position
-        target = target[start_y:end_y, start_x:end_x]
-        ref1 = ref1[start_y:end_y, start_x:end_x]
-        ref2 = ref2[start_y:end_y, start_x:end_x]
-        gt_mask = gt_mask[start_y:end_y, start_x:end_x]
         
         # Stack as 3-channel input
         three_channel = np.stack([target, ref1, ref2], axis=0)  # (3, H, W)
@@ -181,19 +199,36 @@ class Dataset(Dataset):
             "target_mask": gt_mask_tensor
         }
     
-    def generate_defect_images_on_channels(self, target_channel, ref1_channel, ref2_channel):
+    def generate_defect_images_on_channels(self, target_channel, ref1_channel, ref2_channel,
+                                          patch_offset_y=0, patch_offset_x=0, 
+                                          full_image_shape=None):
         """
         Generate defects and apply to three channels separately
+        New strategy: 50% chance to have defects in this patch
+        
+        Args:
+            target_channel, ref1_channel, ref2_channel: patch channels (already cropped)
+            patch_offset_y, patch_offset_x: patch position in the full image (not used in new strategy)
+            full_image_shape: (h, w) of the full image (not used in new strategy)
         """
-        h, w = target_channel.shape
+        h, w = target_channel.shape  # patch dimensions
         
-        # Random number of defects
-        num_defects = np.random.randint(*self.num_defects_range)
+        # 50% chance to have defects in this patch
+        has_defects = np.random.rand() < 0.5
         
-        # Generate defect parameters
+        if not has_defects:
+            # No defects - return original channels
+            gt_mask = np.zeros_like(target_channel, dtype=np.float32)
+            return target_channel.copy(), ref1_channel.copy(), ref2_channel.copy(), gt_mask
+        
+        # If we have defects, generate 3-8 defects directly on the patch
+        # Use at least 3 defects to ensure effective contrastive learning
+        num_defects = np.random.randint(3, 9)  # 3 to 8 defects
+        
+        # Generate defect parameters in PATCH coordinates
         defect_params = []
         for i in range(num_defects):
-            # Random position
+            # Random position in patch
             margin = 5
             cx = np.random.randint(margin, w - margin)
             cy = np.random.randint(margin, h - margin)
@@ -201,7 +236,7 @@ class Dataset(Dataset):
             # Random size (3x3 or 3x5)
             if np.random.rand() > 0.5:
                 size = (3, 3)
-                sigma = 1.0
+                sigma = 1.3  # Increased from 1.0 to make mask larger
             else:
                 size = (3, 5)
                 sigma = (1.0, 1.5)
@@ -221,62 +256,84 @@ class Dataset(Dataset):
         target = target_channel.copy()
         ref1 = ref1_channel.copy()
         ref2 = ref2_channel.copy()
-        all_masks = []
         
-        # Generate all defects
-        all_defects = []
-        for params in defect_params:
-            defect = create_gaussian_defect(
+        # New smart allocation strategy for contrastive learning
+        
+        # Step 1: Ensure at least 1-2 target-only defects
+        num_target_only = np.random.randint(1, min(3, num_defects // 2 + 1))
+        target_only_ids = set(np.random.choice(num_defects, num_target_only, replace=False))
+        
+        # Step 2: Allocate remaining defects to maximize contrastive signal
+        remaining_ids = list(set(range(num_defects)) - target_only_ids)
+        np.random.shuffle(remaining_ids)
+        
+        # Initialize sets
+        only_ref1_ids = set()
+        only_ref2_ids = set()
+        both_refs_ids = set()
+        
+        # Distribute remaining defects to ensure ref1 != ref2
+        if len(remaining_ids) >= 2:
+            # Split into three groups for diversity
+            n_remaining = len(remaining_ids)
+            n_only_ref1 = n_remaining // 3
+            n_only_ref2 = n_remaining // 3
+            # Rest goes to both_refs
+            
+            only_ref1_ids = set(remaining_ids[:n_only_ref1])
+            only_ref2_ids = set(remaining_ids[n_only_ref1:n_only_ref1 + n_only_ref2])
+            both_refs_ids = set(remaining_ids[n_only_ref1 + n_only_ref2:])
+        elif len(remaining_ids) == 1:
+            # With only 1 remaining, randomly assign to ref1 or ref2
+            if np.random.rand() < 0.5:
+                only_ref1_ids = set(remaining_ids)
+            else:
+                only_ref2_ids = set(remaining_ids)
+        
+        # Build removal sets based on allocation
+        # Remove from ref1: target-only + only_ref2
+        remove_ref1 = target_only_ids | only_ref2_ids
+        # Remove from ref2: target-only + only_ref1
+        remove_ref2 = target_only_ids | only_ref1_ids
+        
+        # Initialize ground truth mask
+        gt_mask = np.zeros((h, w), dtype=np.float32)
+        
+        # Now render defects directly on the patch
+        for i, params in enumerate(defect_params):
+            # Generate defect directly in patch coordinates
+            local_defect, bounds = create_local_gaussian_defect(
                 center=params['center'],
                 size=params['size'],
                 sigma=params['sigma'],
-                image_shape=(h, w)
+                patch_shape=(h, w),
+                patch_offset=(0, 0)  # No offset needed since we're working in patch coordinates
             )
-            mask = create_binary_mask(defect, threshold=0.1)
-            all_masks.append(mask)
-            all_defects.append((defect, params['intensity']))
-        
-        # Apply all defects to target
-        for defect, intensity in all_defects:
-            target = apply_defect_to_background(target, defect, intensity)
-        
-        # Randomly decide which defects to remove from ref1 and ref2
-        max_remove = max(1, num_defects - 2)
-        
-        if np.random.rand() < 0.8 and num_defects >= 3:
-            # 80% chance: ensure at least some target-only defects
-            num_remove_ref1 = np.random.randint(1, max_remove + 1)
-            num_remove_ref2 = np.random.randint(1, max_remove + 1)
             
-            remove_ref1 = np.random.choice(num_defects, num_remove_ref1, replace=False)
-            remove_ref2 = np.random.choice(num_defects, num_remove_ref2, replace=False)
+            if local_defect is None:
+                continue  # Should not happen with proper margin
             
-            # Force overlap: randomly pick 1-2 indices from ref1 and add to ref2
-            num_force_overlap = min(2, num_remove_ref1)
-            overlap_indices = np.random.choice(remove_ref1, num_force_overlap, replace=False)
+            # Apply to channels based on pre-determined assignment
+            intensity = params['intensity']
             
-            # Merge and remove duplicates
-            remove_ref2 = np.unique(np.concatenate([remove_ref2, overlap_indices]))
-        else:
-            # 20% chance: completely random (may have no target-only defects)
-            num_remove_ref1 = np.random.randint(1, max_remove + 1)
-            num_remove_ref2 = np.random.randint(1, max_remove + 1)
+            # Target always gets the defect
+            target = apply_local_defect_to_background(target, local_defect, bounds, intensity)
             
-            remove_ref1 = np.random.choice(num_defects, num_remove_ref1, replace=False)
-            remove_ref2 = np.random.choice(num_defects, num_remove_ref2, replace=False)
-        
-        # Apply selected defects to ref1 and ref2
-        for i, (defect, intensity) in enumerate(all_defects):
+            # Ref1: only if not in remove_ref1
             if i not in remove_ref1:
-                ref1 = apply_defect_to_background(ref1, defect, intensity)
+                ref1 = apply_local_defect_to_background(ref1, local_defect, bounds, intensity)
             
+            # Ref2: only if not in remove_ref2
             if i not in remove_ref2:
-                ref2 = apply_defect_to_background(ref2, defect, intensity)
-        
-        # Create ground truth mask (defects only in target)
-        gt_mask = np.zeros((h, w), dtype=np.float32)
-        for i in range(num_defects):
-            if i in remove_ref1 and i in remove_ref2:
-                gt_mask = np.maximum(gt_mask, all_masks[i])
+                ref2 = apply_local_defect_to_background(ref2, local_defect, bounds, intensity)
+            
+            # Ground truth mask: only if this is a target-only defect
+            if i in target_only_ids:
+                local_mask = create_binary_mask(local_defect, threshold=0.1)
+                y_start, y_end, x_start, x_end = bounds
+                gt_mask[y_start:y_end, x_start:x_end] = np.maximum(
+                    gt_mask[y_start:y_end, x_start:x_end],
+                    local_mask
+                )
         
         return target, ref1, ref2, gt_mask

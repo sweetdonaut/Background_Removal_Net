@@ -47,17 +47,26 @@ output = np.clip(output, 0, 255)
 3. **Ref2 通道**：隨機移除部分缺陷（與 Ref1 不同）
 4. **Ground Truth**：只標記「Target 有但 Ref1 和 Ref2 都沒有」的缺陷
 
-### 實作細節
-```python
-# 缺陷移除邏輯
-remove_ref1 = np.random.choice(num_defects, num_remove_ref1, replace=False)
-remove_ref2 = np.random.choice(num_defects, num_remove_ref2, replace=False)
+### 實作細節（2025年8月更新：智慧分配策略）
 
-# Ground truth 生成
-for i in range(num_defects):
-    if i in remove_ref1 and i in remove_ref2:
-        gt_mask = np.maximum(gt_mask, all_masks[i])
+**缺陷分配邏輯**：
+1. **Target-only defects**：1-2 個（必定進入 GT mask）
+2. **Only in Ref1**：約 1/3 的剩餘缺陷
+3. **Only in Ref2**：約 1/3 的剩餘缺陷
+4. **Both Refs**：約 1/3 的剩餘缺陷（背景特徵）
+
+**範例（5 個缺陷）**：
 ```
+Target: [A, B, C, D, E]  # 所有缺陷
+Ref1:   [A, C]          # 只有 A 和 C
+Ref2:   [B, C]          # 只有 B 和 C
+GT Mask:[D, E]          # Target-only 缺陷
+```
+
+這樣確保：
+- 每個 patch 都有學習價值（至少 1 個 target-only）
+- Ref1 和 Ref2 總是不同（提供對比學習信號）
+- 平衡各種缺陷類型的分布
 
 ## 設計優勢
 
@@ -68,11 +77,12 @@ for i in range(num_defects):
 
 ## 確定的參數
 
-- **缺陷數量**：5-15 個（可調整）
-- **缺陷強度**：[-50, -30, 30, 50]（暗/亮缺陷混合）
-- **缺陷間距**：最小 20 像素邊界
-- **影像大小**：256x256（訓練時）
+- **缺陷數量**：3-8 個（在每個 256x256 patch 上生成）
+- **缺陷強度**：[-80, -60, 60, 80]（暗/亮缺陷混合，已提升 60%）
+- **缺陷間距**：最小 5 像素邊界（patch 內）
+- **影像大小**：256x256（訓練時的 patch 大小）
 - **Binary mask 閾值**：0.1
+- **缺陷生成機率**：50%（每個 patch 有 50% 機率含有缺陷）
 
 ## 實作檔案
 - `gaussian.py`：核心缺陷生成功能（已完成）

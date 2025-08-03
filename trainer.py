@@ -62,6 +62,10 @@ def evaluate_model(model, valid_root, ground_truth_root, img_format, patch_size,
                 if image is None:
                     print(f"Warning: Failed to load image {img_path}")
                     continue
+                
+                # Convert from CHW to HWC format for stripe dataset
+                if image_type == 'strip' and image.shape[0] == 3:
+                    image = np.transpose(image, (1, 2, 0))
                     
                 h, w = image.shape[:2]
                 
@@ -211,14 +215,17 @@ def train_on_device(args):
         last_epoch=-1
     )
     
-    loss_focal = FocalLoss()
+    # Initialize loss function
+    criterion = FocalLoss()
+    print("Using Focal Loss")
     
     dataset = Dataset(
         training_path=args.training_dataset_path,
         patch_size=patch_size,
         num_defects_range=args.num_defects_range,
         img_format=args.img_format,
-        image_type=args.image_type
+        image_type=args.image_type,
+        cache_size=args.cache_size
     )
     
     dataloader = DataLoader(dataset, batch_size=args.bs, shuffle=True, num_workers=7)
@@ -239,7 +246,7 @@ def train_on_device(args):
             out_mask_sm = torch.softmax(out_mask, dim=1)
             
             # Calculate loss (always use the dynamically generated mask)
-            loss = loss_focal(out_mask_sm, target_mask)
+            loss = criterion(out_mask_sm, target_mask)
             
             optimizer.zero_grad()
             loss.backward()
@@ -252,13 +259,13 @@ def train_on_device(args):
                 current_lr = get_lr(optimizer)
                 progress = (i_batch + 1) / num_batches * 100
                 print(f'\rEpoch [{epoch+1}/{args.epochs}] - Batch [{i_batch+1}/{num_batches}] ({progress:.1f}%) - '
-                      f'Loss: {loss.item():.4f} - LR: {current_lr:.6f}', end='', flush=True)
+                      f'Loss: {loss.item():.4e} - LR: {current_lr:.6f}', end='', flush=True)
         
         scheduler.step()
         
         # Print epoch summary
         avg_loss = epoch_loss / num_batches
-        print(f'\nEpoch [{epoch+1}/{args.epochs}] Summary - Avg Loss: {avg_loss:.4f}', end='')
+        print(f'\nEpoch [{epoch+1}/{args.epochs}] Summary - Avg Loss: {avg_loss:.4e}', end='')
         
         # Evaluate on validation set if use_mask is True
         if args.use_mask == 'True':
@@ -311,6 +318,8 @@ def main():
                         help='Whether to use mask for training (True: normal training, False: no mask supervision)')
     parser.add_argument('--seed', type=int, default=None,
                         help='Random seed for reproducibility')
+    parser.add_argument('--cache_size', type=int, default=0,
+                        help='Number of images to cache in memory (0 = no cache)')
     
     args = parser.parse_args()
     

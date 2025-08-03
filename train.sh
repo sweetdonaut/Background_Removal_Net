@@ -1,11 +1,12 @@
 python trainer.py \
     --bs 16 \
-    --lr 0.001 \
-    --epochs 1 \
+    --lr 0.0001 \
+    --epochs 100 \
     --gpu_id 0 \
     --checkpoint_path ./checkpoints/stripe_experiment \
     --image_type strip \
     --training_dataset_path ./MVTec_AD_dataset/grid_stripe/train/good/ \
     --img_format tiff \
     --use_mask False \
-    --seed 42
+    --seed 42 \
+    --cache_size 200

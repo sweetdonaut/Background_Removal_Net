@@ -56,6 +56,10 @@ class InferenceDataset(Dataset):
             image = cv2.imread(img_path)
             # Keep as uint8, will convert when normalizing
         
+        # Convert from CHW to HWC format for stripe dataset
+        if self.image_type == 'strip' and image.shape[0] == 3:
+            image = np.transpose(image, (1, 2, 0))
+        
         # Store original image and info
         original_h, original_w = image.shape[:2]
         
@@ -66,7 +70,7 @@ class InferenceDataset(Dataset):
         }
 
 
-def sliding_window_inference(image, model, patch_size, device):
+def sliding_window_inference(image, model, patch_size, device, image_type='mvtec'):
     """Perform sliding window inference using adaptive window positioning"""
     h, w = image.shape[:2]
     patch_h, patch_w = patch_size
@@ -77,7 +81,11 @@ def sliding_window_inference(image, model, patch_size, device):
                          f"Please provide images at least {patch_h}x{patch_w} in size.")
     
     # Calculate adaptive positions (same as training)
-    y_positions = calculate_positions(h, patch_h)
+    if image_type == 'strip':
+        # For strip images, use 9 patches in Y direction (same as training)
+        y_positions = calculate_positions(h, patch_h, min_patches=9)
+    else:
+        y_positions = calculate_positions(h, patch_h)
     x_positions = calculate_positions(w, patch_w)
     
     if y_positions is None or x_positions is None:
@@ -88,8 +96,8 @@ def sliding_window_inference(image, model, patch_size, device):
     weight_map = np.zeros((h, w), dtype=np.float32)
     
     # Sliding window with adaptive positions
-    for y in y_positions:
-        for x in x_positions:
+    for y_idx, y in enumerate(y_positions):
+        for x_idx, x in enumerate(x_positions):
             # Extract patch
             patch = image[y:y+patch_h, x:x+patch_w]
             
@@ -109,9 +117,69 @@ def sliding_window_inference(image, model, patch_size, device):
                 output_sm = F.softmax(output, dim=1)
                 patch_heatmap = output_sm[:, 1, :, :].squeeze().cpu().numpy()
             
-            # Accumulate results
-            output_heatmap[y:y+patch_h, x:x+patch_w] += patch_heatmap
-            weight_map[y:y+patch_h, x:x+patch_w] += 1
+            # Determine which region to use based on patch position
+            if image_type == 'strip' and len(y_positions) > 2:
+                # For strip images with multiple patches, use center-only strategy
+                if y_idx == 0:
+                    # First patch: keep top edge, remove bottom overlap
+                    y_start_crop = 0
+                    y_end_crop = patch_h - 11  # Remove bottom 11 pixels
+                elif y_idx == len(y_positions) - 1:
+                    # Last patch: remove top overlap, keep bottom edge
+                    y_start_crop = 11  # Remove top 11 pixels
+                    y_end_crop = patch_h
+                else:
+                    # Middle patches: use only center region
+                    y_start_crop = 11  # Remove top 11 pixels
+                    y_end_crop = patch_h - 11  # Remove bottom 11 pixels
+                
+                # X direction: handle overlap if there are multiple patches
+                if len(x_positions) > 1:
+                    x_stride = x_positions[1] - x_positions[0]  # Should be 48
+                    x_margin = (patch_w - x_stride) // 2  # Should be 40
+                    
+                    if x_idx == 0:
+                        # First patch in X: keep left edge, remove right overlap
+                        x_start_crop = 0
+                        x_end_crop = patch_w - x_margin
+                    elif x_idx == len(x_positions) - 1:
+                        # Last patch in X: remove left overlap, keep right edge
+                        x_start_crop = x_margin
+                        x_end_crop = patch_w
+                    else:
+                        # Middle patches in X (if any): use center only
+                        x_start_crop = x_margin
+                        x_end_crop = patch_w - x_margin
+                else:
+                    # Only one patch in X direction
+                    x_start_crop = 0
+                    x_end_crop = patch_w
+                
+                # Extract the region to use
+                patch_region = patch_heatmap[y_start_crop:y_end_crop, x_start_crop:x_end_crop]
+                
+                # Calculate where to place this region in the output
+                output_y_start = y + y_start_crop
+                output_y_end = y + y_end_crop
+                output_x_start = x + x_start_crop
+                output_x_end = x + x_end_crop
+                
+                # Direct assignment (no averaging needed)
+                output_heatmap[output_y_start:output_y_end, output_x_start:output_x_end] = patch_region
+                weight_map[output_y_start:output_y_end, output_x_start:output_x_end] = 1
+            else:
+                # Original strategy for other image types
+                valid_mask = np.ones_like(patch_heatmap)
+                valid_mask[:1, :] = 0  # Top row
+                valid_mask[-1:, :] = 0  # Bottom row
+                valid_mask[:, :1] = 0  # Left column
+                valid_mask[:, -1:] = 0  # Right column
+                
+                patch_heatmap = patch_heatmap * valid_mask
+                
+                # Accumulate results for averaging
+                output_heatmap[y:y+patch_h, x:x+patch_w] += patch_heatmap
+                weight_map[y:y+patch_h, x:x+patch_w] += valid_mask
     
     # Average overlapping regions
     output_heatmap = output_heatmap / np.maximum(weight_map, 1)
@@ -127,9 +195,9 @@ def visualize_results(image, heatmap, output_path):
     ref1 = image[:, :, 1]
     ref2 = image[:, :, 2]
     
-    # Create figure with subplots
-    fig = plt.figure(figsize=(18, 6))
-    gs = gridspec.GridSpec(1, 6, figure=fig)
+    # Create figure with subplots (now 7 subplots)
+    fig = plt.figure(figsize=(9.5, 6), dpi=200)
+    gs = gridspec.GridSpec(1, 7, figure=fig)
     
     # 1. Target
     ax1 = fig.add_subplot(gs[0])
@@ -160,7 +228,7 @@ def visualize_results(image, heatmap, output_path):
     else:
         d1_vmin, d1_vmax = diff1_min, diff1_max
     ax4.imshow(diff1, cmap='hot', vmin=d1_vmin, vmax=d1_vmax)
-    ax4.set_title(f'Target - Ref1 ({d1_vmin:.1f}-{d1_vmax:.1f})')
+    ax4.set_title(f'Target - Ref1')
     ax4.axis('off')
     
     # 5. Target - Ref2
@@ -174,11 +242,25 @@ def visualize_results(image, heatmap, output_path):
     else:
         d2_vmin, d2_vmax = diff2_min, diff2_max
     ax5.imshow(diff2, cmap='hot', vmin=d2_vmin, vmax=d2_vmax)
-    ax5.set_title(f'Target - Ref2 ({d2_vmin:.1f}-{d2_vmax:.1f})')
+    ax5.set_title(f'Target - Ref2')
     ax5.axis('off')
     
-    # 6. Heatmap
+    # 6. Double Detection (min of diff1 and diff2)
     ax6 = fig.add_subplot(gs[5])
+    double_detection = np.minimum(diff1, diff2)
+    # Dynamic range for double detection
+    dd_min = double_detection.min()
+    dd_max = double_detection.max()
+    if dd_max - dd_min < 1e-8:
+        dd_vmin, dd_vmax = 0, 255
+    else:
+        dd_vmin, dd_vmax = dd_min, dd_max
+    ax6.imshow(double_detection, cmap='hot', vmin=dd_vmin, vmax=dd_vmax)
+    ax6.set_title('Double Det.')
+    ax6.axis('off')
+    
+    # 7. Heatmap
+    ax7 = fig.add_subplot(gs[6])
     # Dynamic range adjustment for better visibility
     heatmap_min = heatmap.min()
     heatmap_max = heatmap.max()
@@ -191,12 +273,12 @@ def visualize_results(image, heatmap, output_path):
         # Use actual min/max for better contrast
         vmin, vmax = heatmap_min, heatmap_max
     
-    im = ax6.imshow(heatmap, cmap='jet', vmin=vmin, vmax=vmax)
-    ax6.set_title(f'Heatmap (range: {vmin:.4f}-{vmax:.4f})')
-    ax6.axis('off')
+    im = ax7.imshow(heatmap, cmap='hot', vmin=vmin, vmax=vmax)
+    ax7.set_title(f'Heatmap')
+    ax7.axis('off')
     
     # Add colorbar for heatmap
-    plt.colorbar(im, ax=ax6, fraction=0.046, pad=0.04)
+    plt.colorbar(im, ax=ax7, fraction=0.046, pad=0.04)
     
     plt.tight_layout()
     plt.savefig(output_path, dpi=150, bbox_inches='tight')
@@ -266,7 +348,7 @@ def inference(args):
         
         # Perform sliding window inference with adaptive positioning
         heatmap, processed_image = sliding_window_inference(
-            image, model, patch_size, device
+            image, model, patch_size, device, image_type
         )
         
         # Save visualization
