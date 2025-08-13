@@ -14,7 +14,7 @@ from gaussian import (
 )
 from functools import lru_cache
 import psutil
-
+from scipy.ndimage import gaussian_filter
 
 def calculate_positions(img_size, patch_size, min_patches=2):
     """Calculate patch positions: minimum overlap, maximum coverage
@@ -205,7 +205,7 @@ class Dataset(Dataset):
         """
         Generate defects and apply to three channels separately
         New strategy: 
-        - 20% chance to generate edge negative samples (edge enhancement without GT mask)
+        - 20% chance to generate edge negative samples (only if structural edges exist)
         - 40% chance to have point defects
         - 40% chance to have no modifications
         
@@ -219,10 +219,14 @@ class Dataset(Dataset):
         # Decide what type of augmentation to apply
         rand_val = np.random.rand()
         
-        if rand_val < 0.2:  # 20% chance: Edge negative samples
-            # Generate edge enhancement as negative samples
-            # These should NOT be detected as defects
-            return self._generate_edge_negative_samples(target_channel, ref1_channel, ref2_channel)
+        if rand_val < 0.2:  # 20% chance: Try edge negative samples
+            # First check if this patch has structural edges
+            if self._has_structural_edges(target_channel):
+                # Has structural edges, apply edge enhancement
+                return self._generate_edge_negative_samples(target_channel, ref1_channel, ref2_channel)
+            else:
+                # No structural edges, generate point defects instead
+                pass  # Continue with point defect generation below
         
         elif rand_val < 0.6:  # 40% chance: Point defects (original logic)
             # Continue with original point defect generation
@@ -350,6 +354,35 @@ class Dataset(Dataset):
         
         return target, ref1, ref2, gt_mask
     
+    def _has_structural_edges(self, image_patch, edge_ratio_threshold=0.02):
+        """
+        Check if a patch has structural edges (grid, stripes) rather than point defects
+        
+        Args:
+            image_patch: Input patch to check
+            edge_ratio_threshold: Minimum ratio of edge pixels to be considered structural
+                                 Default 0.02 (2%) safely excludes point defects
+        
+        Returns:
+            bool: True if structural edges exist, False otherwise
+        """
+        # Convert to uint8 for Canny edge detection
+        patch_uint8 = np.clip(image_patch, 0, 255).astype(np.uint8)
+        
+        # Detect edges using Canny
+        edges = cv2.Canny(patch_uint8, 50, 150)
+        
+        # Calculate edge pixel ratio
+        edge_ratio = np.sum(edges > 0) / edges.size
+        
+        # Based on testing:
+        # - Single defects: ~0.1% edge ratio
+        # - Multiple defects (5-8): ~0.5-0.7% edge ratio  
+        # - Grid/stripe structures: >9% edge ratio
+        # Using 2% threshold provides safe margin
+        
+        return edge_ratio > edge_ratio_threshold
+    
     def _generate_edge_negative_samples(self, target_channel, ref1_channel, ref2_channel):
         """
         Generate edge enhancement as negative samples.
@@ -378,7 +411,7 @@ class Dataset(Dataset):
         edge_mask = edges_dilated.astype(np.float32) / 255.0
         
         # Apply Gaussian blur to make the edge enhancement smoother
-        from scipy.ndimage import gaussian_filter
+        
         edge_mask_smooth = gaussian_filter(edge_mask, sigma=1.0)
         
         # Generate random enhancement patterns
