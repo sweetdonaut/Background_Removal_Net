@@ -204,10 +204,7 @@ class Dataset(Dataset):
                                           full_image_shape=None):
         """
         Generate defects and apply to three channels separately
-        New strategy: 
-        - 20% chance to generate edge negative samples (edge enhancement without GT mask)
-        - 40% chance to have point defects
-        - 40% chance to have no modifications
+        New strategy: 50% chance to have defects in this patch
         
         Args:
             target_channel, ref1_channel, ref2_channel: patch channels (already cropped)
@@ -216,19 +213,10 @@ class Dataset(Dataset):
         """
         h, w = target_channel.shape  # patch dimensions
         
-        # Decide what type of augmentation to apply
-        rand_val = np.random.rand()
+        # 50% chance to have defects in this patch
+        has_defects = np.random.rand() < 0.5
         
-        if rand_val < 0.2:  # 20% chance: Edge negative samples
-            # Generate edge enhancement as negative samples
-            # These should NOT be detected as defects
-            return self._generate_edge_negative_samples(target_channel, ref1_channel, ref2_channel)
-        
-        elif rand_val < 0.6:  # 40% chance: Point defects (original logic)
-            # Continue with original point defect generation
-            pass  # Will continue below
-        
-        else:  # 40% chance: No modifications
+        if not has_defects:
             # No defects - return original channels
             gt_mask = np.zeros_like(target_channel, dtype=np.float32)
             return target_channel.copy(), ref1_channel.copy(), ref2_channel.copy(), gt_mask
@@ -347,90 +335,5 @@ class Dataset(Dataset):
                     gt_mask[y_start:y_end, x_start:x_end],
                     local_mask
                 )
-        
-        return target, ref1, ref2, gt_mask
-    
-    def _generate_edge_negative_samples(self, target_channel, ref1_channel, ref2_channel):
-        """
-        Generate edge enhancement as negative samples.
-        These edges should NOT be detected as defects (GT mask = 0).
-        This helps the model learn to distinguish between edge differences and real point defects.
-        """
-        h, w = target_channel.shape
-        
-        # Create copies for modification
-        target = target_channel.copy()
-        ref1 = ref1_channel.copy()
-        ref2 = ref2_channel.copy()
-        
-        # Detect edges using Canny edge detector
-        # Convert to uint8 for Canny
-        target_uint8 = np.clip(target, 0, 255).astype(np.uint8)
-        
-        # Use Canny to detect edges
-        edges = cv2.Canny(target_uint8, 50, 150)
-        
-        # Dilate edges to make them thicker (more realistic)
-        kernel = np.ones((3, 3), np.uint8)
-        edges_dilated = cv2.dilate(edges, kernel, iterations=1)
-        
-        # Convert to float mask
-        edge_mask = edges_dilated.astype(np.float32) / 255.0
-        
-        # Apply Gaussian blur to make the edge enhancement smoother
-        from scipy.ndimage import gaussian_filter
-        edge_mask_smooth = gaussian_filter(edge_mask, sigma=1.0)
-        
-        # Generate random enhancement patterns
-        enhancement_type = np.random.choice(['brightness', 'mixed', 'noise'])
-        
-        if enhancement_type == 'brightness':
-            # Simple brightness difference at edges
-            edge_intensity = np.random.uniform(10, 30)
-            target = target + edge_mask_smooth * edge_intensity
-            ref1 = ref1 - edge_mask_smooth * edge_intensity * 0.5
-            ref2 = ref2 - edge_mask_smooth * edge_intensity * 0.5
-            
-        elif enhancement_type == 'mixed':
-            # Different enhancement for each channel
-            target = target + edge_mask_smooth * np.random.uniform(5, 20)
-            ref1 = ref1 + edge_mask_smooth * np.random.uniform(-10, 10)
-            ref2 = ref2 + edge_mask_smooth * np.random.uniform(-10, 10)
-            
-        else:  # 'noise'
-            # Add noise specifically at edges
-            edge_noise_target = np.random.randn(h, w) * edge_mask_smooth * 10
-            edge_noise_ref1 = np.random.randn(h, w) * edge_mask_smooth * 10
-            edge_noise_ref2 = np.random.randn(h, w) * edge_mask_smooth * 10
-            
-            target = target + edge_noise_target
-            ref1 = ref1 + edge_noise_ref1
-            ref2 = ref2 + edge_noise_ref2
-        
-        # Occasionally add some stripe patterns as well (10% chance)
-        if np.random.rand() < 0.1:
-            # Add horizontal or vertical stripes
-            if np.random.rand() < 0.5:
-                # Horizontal stripes
-                stripe_intensity = np.random.uniform(5, 15)
-                for y in range(0, h, np.random.randint(8, 20)):
-                    target[y:y+2, :] += stripe_intensity
-                    ref1[y:y+2, :] -= stripe_intensity * 0.3
-                    ref2[y:y+2, :] -= stripe_intensity * 0.3
-            else:
-                # Vertical stripes
-                stripe_intensity = np.random.uniform(5, 15)
-                for x in range(0, w, np.random.randint(8, 20)):
-                    target[:, x:x+2] += stripe_intensity
-                    ref1[:, x:x+2] -= stripe_intensity * 0.3
-                    ref2[:, x:x+2] -= stripe_intensity * 0.3
-        
-        # Clip values to valid range
-        target = np.clip(target, 0, 255)
-        ref1 = np.clip(ref1, 0, 255)
-        ref2 = np.clip(ref2, 0, 255)
-        
-        # IMPORTANT: GT mask is all zeros - these are NOT defects!
-        gt_mask = np.zeros_like(target_channel, dtype=np.float32)
         
         return target, ref1, ref2, gt_mask
