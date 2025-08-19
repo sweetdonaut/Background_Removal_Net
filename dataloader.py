@@ -219,27 +219,22 @@ class Dataset(Dataset):
         # Decide what type of augmentation to apply
         rand_val = np.random.rand()
         
-        if rand_val < 0.2:  # 20% chance: Try edge negative samples
-            # First check if this patch has structural edges
-            if self._has_structural_edges(target_channel):
-                # Has structural edges, apply edge enhancement
-                return self._generate_edge_negative_samples(target_channel, ref1_channel, ref2_channel)
-            else:
-                # No structural edges, generate point defects instead
-                pass  # Continue with point defect generation below
+        if rand_val < 0.2:  # 20% chance: Generate line negative samples
+            # Generate synthetic lines as negative samples
+            return self._generate_edge_negative_samples(target_channel, ref1_channel, ref2_channel)
         
-        elif rand_val < 0.6:  # 40% chance: Point defects (original logic)
+        elif rand_val < 0.6:  # 40% chance: Point defects (20% to 60%)
             # Continue with original point defect generation
             pass  # Will continue below
         
-        else:  # 40% chance: No modifications
+        else:  # 40% chance: No modifications (60% to 100%)
             # No defects - return original channels
             gt_mask = np.zeros_like(target_channel, dtype=np.float32)
             return target_channel.copy(), ref1_channel.copy(), ref2_channel.copy(), gt_mask
         
-        # If we have defects, generate 3-8 defects directly on the patch
-        # Use at least 3 defects to ensure effective contrastive learning
-        num_defects = np.random.randint(3, 9)  # 3 to 8 defects
+        # If we have defects, generate defects directly on the patch
+        # Use num_defects_range from initialization
+        num_defects = np.random.randint(self.num_defects_range[0], self.num_defects_range[1] + 1)
         
         # Generate defect parameters in PATCH coordinates
         defect_params = []
@@ -255,7 +250,8 @@ class Dataset(Dataset):
                 sigma = 1.3  # Increased from 1.0 to make mask larger
             else:
                 size = (3, 5)
-                sigma = (1.0, 1.5)
+                # Increase sigma_x to 2.0 for better edge visibility in 5-pixel width
+                sigma = (2.0, 1.5)  # (sigma_x, sigma_y) - increased x from 1.0 to 2.0
             
             # Random intensity - increased for better visibility
             intensity = np.random.choice([-80, -60, 60, 80])
@@ -385,9 +381,9 @@ class Dataset(Dataset):
     
     def _generate_edge_negative_samples(self, target_channel, ref1_channel, ref2_channel):
         """
-        Generate edge enhancement as negative samples.
-        These edges should NOT be detected as defects (GT mask = 0).
-        This helps the model learn to distinguish between edge differences and real point defects.
+        Generate line patterns as negative samples.
+        These lines should NOT be detected as defects (GT mask = 0).
+        This helps the model learn to distinguish between continuous lines and point defects.
         """
         h, w = target_channel.shape
         
@@ -396,69 +392,75 @@ class Dataset(Dataset):
         ref1 = ref1_channel.copy()
         ref2 = ref2_channel.copy()
         
-        # Detect edges using Canny edge detector
-        # Convert to uint8 for Canny
-        target_uint8 = np.clip(target, 0, 255).astype(np.uint8)
+        # Generate 1-3 random lines
+        num_lines = np.random.randint(1, 4)
         
-        # Use Canny to detect edges
-        edges = cv2.Canny(target_uint8, 50, 150)
-        
-        # Dilate edges to make them thicker (more realistic)
-        kernel = np.ones((3, 3), np.uint8)
-        edges_dilated = cv2.dilate(edges, kernel, iterations=1)
-        
-        # Convert to float mask
-        edge_mask = edges_dilated.astype(np.float32) / 255.0
-        
-        # Apply Gaussian blur to make the edge enhancement smoother
-        
-        edge_mask_smooth = gaussian_filter(edge_mask, sigma=1.0)
-        
-        # Generate random enhancement patterns
-        enhancement_type = np.random.choice(['brightness', 'mixed', 'noise'])
-        
-        if enhancement_type == 'brightness':
-            # Simple brightness difference at edges
-            edge_intensity = np.random.uniform(10, 30)
-            target = target + edge_mask_smooth * edge_intensity
-            ref1 = ref1 - edge_mask_smooth * edge_intensity * 0.5
-            ref2 = ref2 - edge_mask_smooth * edge_intensity * 0.5
+        for _ in range(num_lines):
+            # Random line width (1 or 2 pixels)
+            line_width = np.random.choice([1, 2])
             
-        elif enhancement_type == 'mixed':
-            # Different enhancement for each channel
-            target = target + edge_mask_smooth * np.random.uniform(5, 20)
-            ref1 = ref1 + edge_mask_smooth * np.random.uniform(-10, 10)
-            ref2 = ref2 + edge_mask_smooth * np.random.uniform(-10, 10)
+            # Randomly choose horizontal or vertical line
+            is_horizontal = np.random.rand() < 0.5
             
-        else:  # 'noise'
-            # Add noise specifically at edges
-            edge_noise_target = np.random.randn(h, w) * edge_mask_smooth * 10
-            edge_noise_ref1 = np.random.randn(h, w) * edge_mask_smooth * 10
-            edge_noise_ref2 = np.random.randn(h, w) * edge_mask_smooth * 10
-            
-            target = target + edge_noise_target
-            ref1 = ref1 + edge_noise_ref1
-            ref2 = ref2 + edge_noise_ref2
-        
-        # Occasionally add some stripe patterns as well (10% chance)
-        if np.random.rand() < 0.1:
-            # Add horizontal or vertical stripes
-            if np.random.rand() < 0.5:
-                # Horizontal stripes
-                stripe_intensity = np.random.uniform(5, 15)
-                for y in range(0, h, np.random.randint(8, 20)):
-                    target[y:y+2, :] += stripe_intensity
-                    ref1[y:y+2, :] -= stripe_intensity * 0.3
-                    ref2[y:y+2, :] -= stripe_intensity * 0.3
+            if is_horizontal:
+                # Horizontal line
+                y = np.random.randint(0, h - line_width + 1)
+                
+                # Get the line region to check current values
+                line_target = target[y:y+line_width, :]
+                line_ref1 = ref1[y:y+line_width, :]
+                line_ref2 = ref2[y:y+line_width, :]
             else:
-                # Vertical stripes
-                stripe_intensity = np.random.uniform(5, 15)
-                for x in range(0, w, np.random.randint(8, 20)):
-                    target[:, x:x+2] += stripe_intensity
-                    ref1[:, x:x+2] -= stripe_intensity * 0.3
-                    ref2[:, x:x+2] -= stripe_intensity * 0.3
+                # Vertical line
+                x = np.random.randint(0, w - line_width + 1)
+                
+                # Get the line region to check current values
+                line_target = target[:, x:x+line_width]
+                line_ref1 = ref1[:, x:x+line_width]
+                line_ref2 = ref2[:, x:x+line_width]
+            
+            # Check min/max values in the line region for all channels
+            min_val = min(line_target.min(), line_ref1.min(), line_ref2.min())
+            max_val = max(line_target.max(), line_ref1.max(), line_ref2.max())
+            
+            # Calculate safe intensity range to avoid clipping
+            # For positive (brightening): can add up to (255 - max_val)
+            # For negative (darkening): can subtract up to min_val
+            safe_positive = min(255 - max_val, 50)  # Cap at 50
+            safe_negative = max(-min_val, -50)      # Cap at -50
+            
+            # Determine intensity based on safe range
+            # We want at least ±30 for visibility
+            if safe_positive >= 30 and safe_negative <= -30:
+                # Both directions are safe, randomly choose
+                if np.random.rand() < 0.5:
+                    target_intensity = np.random.uniform(30, safe_positive)
+                else:
+                    target_intensity = np.random.uniform(safe_negative, -30)
+            elif safe_positive >= 30:
+                # Only positive is safe
+                target_intensity = np.random.uniform(30, safe_positive)
+            elif safe_negative <= -30:
+                # Only negative is safe
+                target_intensity = np.random.uniform(safe_negative, -30)
+            else:
+                # Not enough room for a visible line, skip this one
+                continue
+            
+            # Ref channels get weaker intensity (60% of target)
+            ref_intensity = target_intensity * 0.6
+            
+            # Apply the intensity change to the line
+            if is_horizontal:
+                target[y:y+line_width, :] += target_intensity
+                ref1[y:y+line_width, :] += ref_intensity
+                ref2[y:y+line_width, :] += ref_intensity
+            else:
+                target[:, x:x+line_width] += target_intensity
+                ref1[:, x:x+line_width] += ref_intensity
+                ref2[:, x:x+line_width] += ref_intensity
         
-        # Clip values to valid range
+        # Clip values to valid range (should rarely be needed now)
         target = np.clip(target, 0, 255)
         ref1 = np.clip(ref1, 0, 255)
         ref2 = np.clip(ref2, 0, 255)
