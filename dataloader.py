@@ -205,9 +205,9 @@ class Dataset(Dataset):
         """
         Generate defects and apply to three channels separately
         New strategy: 
-        - 20% chance to generate edge negative samples (only if structural edges exist)
-        - 40% chance to have point defects
-        - 40% chance to have no modifications
+        - 20% chance: Line variations + point defects (GT mask only for points)
+        - 40% chance: Pure point defects
+        - 40% chance: No modifications
         
         Args:
             target_channel, ref1_channel, ref2_channel: patch channels (already cropped)
@@ -219,50 +219,78 @@ class Dataset(Dataset):
         # Decide what type of augmentation to apply
         rand_val = np.random.rand()
         
-        if rand_val < 0.2:  # 20% chance: Generate line negative samples
-            # Generate synthetic lines as negative samples
-            return self._generate_edge_negative_samples(target_channel, ref1_channel, ref2_channel)
+        if rand_val < 0.2:  # 20% chance: Line + Point defects
+            # Generate lines with point defects for learning to ignore line patterns
+            return self._generate_line_with_point_defects(target_channel, ref1_channel, ref2_channel)
         
-        elif rand_val < 0.6:  # 40% chance: Point defects (20% to 60%)
+        elif rand_val < 0.6:  # 40% chance: Only point defects (0.2 to 0.6)
             # Continue with original point defect generation
             pass  # Will continue below
         
-        else:  # 40% chance: No modifications (60% to 100%)
+        else:  # 40% chance: No modifications (0.6 to 1.0)
             # No defects - return original channels
             gt_mask = np.zeros_like(target_channel, dtype=np.float32)
             return target_channel.copy(), ref1_channel.copy(), ref2_channel.copy(), gt_mask
         
-        # If we have defects, generate defects directly on the patch
+        # Pure point defects (40% case) - generate defects avoiding real lines
+        # First detect real lines in the original images
+        real_lines = []
+        
+        # Detect lines in each channel and combine
+        for channel in [target_channel, ref1_channel, ref2_channel]:
+            detected_lines = self._detect_real_lines(channel, min_line_length=30)
+            # Add to real_lines if not already there (avoid duplicates)
+            for line in detected_lines:
+                # Simple duplicate check (could be improved)
+                is_duplicate = False
+                for existing in real_lines:
+                    if line['type'] == existing['type']:
+                        if line['type'] == 'horizontal':
+                            if abs(line['y_start'] - existing['y_start']) < 5:
+                                is_duplicate = True
+                                break
+                        else:  # vertical
+                            if abs(line['x_start'] - existing['x_start']) < 5:
+                                is_duplicate = True
+                                break
+                if not is_duplicate:
+                    real_lines.append(line)
+        
         # Use num_defects_range from initialization
         num_defects = np.random.randint(self.num_defects_range[0], self.num_defects_range[1] + 1)
         
-        # Generate defect parameters in PATCH coordinates
-        defect_params = []
-        for i in range(num_defects):
-            # Random position in patch
-            margin = 5
-            cx = np.random.randint(margin, w - margin)
-            cy = np.random.randint(margin, h - margin)
-            
-            # Random size (3x3 or 3x5)
-            if np.random.rand() > 0.5:
-                size = (3, 3)
-                sigma = 1.3  # Increased from 1.0 to make mask larger
-            else:
-                size = (3, 5)
-                # Increase sigma_x to 2.0 for better edge visibility in 5-pixel width
-                sigma = (2.0, 1.5)  # (sigma_x, sigma_y) - increased x from 1.0 to 2.0
-            
-            # Random intensity - increased for better visibility
-            intensity = np.random.choice([-80, -60, 60, 80])
-            
-            defect_params.append({
-                'center': (cx, cy),
-                'size': size,
-                'sigma': sigma,
-                'intensity': intensity,
-                'id': i
-            })
+        # Generate defect parameters avoiding detected lines
+        if real_lines:
+            # Use the avoiding lines function
+            defect_params = self._generate_point_defect_params_avoiding_lines(h, w, real_lines, num_defects)
+        else:
+            # No lines detected, use normal generation
+            defect_params = []
+            for i in range(num_defects):
+                # Random position in patch
+                margin = 5
+                cx = np.random.randint(margin, w - margin)
+                cy = np.random.randint(margin, h - margin)
+                
+                # Random size (3x3 or 3x5)
+                if np.random.rand() > 0.5:
+                    size = (3, 3)
+                    sigma = 1.3  # Increased from 1.0 to make mask larger
+                else:
+                    size = (3, 5)
+                    # Increase sigma_x to 2.0 for better edge visibility in 5-pixel width
+                    sigma = (2.0, 1.5)  # (sigma_x, sigma_y) - increased x from 1.0 to 2.0
+                
+                # Random intensity - increased for better visibility
+                intensity = np.random.choice([-80, -60, 60, 80])
+                
+                defect_params.append({
+                    'center': (cx, cy),
+                    'size': size,
+                    'sigma': sigma,
+                    'intensity': intensity,
+                    'id': i
+                })
         
         # Create copies for modification
         target = target_channel.copy()
@@ -350,34 +378,507 @@ class Dataset(Dataset):
         
         return target, ref1, ref2, gt_mask
     
-    def _has_structural_edges(self, image_patch, edge_ratio_threshold=0.02):
+    def _add_line_variations(self, target, ref1, ref2, return_positions=False):
         """
-        Check if a patch has structural edges (grid, stripes) rather than point defects
-        
-        Args:
-            image_patch: Input patch to check
-            edge_ratio_threshold: Minimum ratio of edge pixels to be considered structural
-                                 Default 0.02 (2%) safely excludes point defects
-        
-        Returns:
-            bool: True if structural edges exist, False otherwise
+        Add line variations to simulate real stripe patterns.
+        Creates line kernels with soft edges, then adds to image.
+        Target: 2-6 pixel wide lines with consistent brightness but edge variations.
+        If return_positions=True, also returns line position info.
         """
-        # Convert to uint8 for Canny edge detection
-        patch_uint8 = np.clip(image_patch, 0, 255).astype(np.uint8)
+        h, w = target.shape
+        line_positions = []  # Store line positions for defect avoidance
         
-        # Detect edges using Canny
-        edges = cv2.Canny(patch_uint8, 50, 150)
+        # Generate 1-3 random lines
+        num_lines = np.random.randint(1, 4)
         
-        # Calculate edge pixel ratio
-        edge_ratio = np.sum(edges > 0) / edges.size
+        for _ in range(num_lines):
+            # Random line width (2-6 pixels after blur)
+            core_width = np.random.choice([1, 2, 3, 4])  # Core width before blur
+            
+            # Randomly choose horizontal or vertical line
+            is_horizontal = np.random.rand() < 0.5
+            
+            # Fixed bright intensity for the line core
+            base_intensity = np.random.uniform(50, 80)
+            
+            if is_horizontal:
+                # Create small kernel for horizontal line
+                kernel_height = core_width + 4  # Extra space for blur
+                kernel_width = w
+                
+                # Random Y position
+                y_pos = np.random.randint(2, h - kernel_height - 2)
+                
+                # Record line position (horizontal line: y range with safety margin)
+                line_positions.append({
+                    'type': 'horizontal',
+                    'y_start': max(0, y_pos - 3),  # 3 pixel safety margin
+                    'y_end': min(h, y_pos + kernel_height + 3)
+                })
+                
+                # Create kernels for each channel
+                kernel_target = np.zeros((kernel_height, kernel_width), dtype=np.float32)
+                kernel_ref1 = np.zeros((kernel_height, kernel_width), dtype=np.float32)
+                kernel_ref2 = np.zeros((kernel_height, kernel_width), dtype=np.float32)
+                
+                # Fill core with base intensity + channel variations
+                core_start = 2  # Start after margin
+                for i in range(core_width):
+                    # Each channel gets slightly different intensity
+                    kernel_target[core_start + i, :] = base_intensity + np.random.uniform(-10, 10)
+                    kernel_ref1[core_start + i, :] = base_intensity + np.random.uniform(-10, 10)
+                    kernel_ref2[core_start + i, :] = base_intensity + np.random.uniform(-10, 10)
+                
+                # Add slight pixel-level variation along the line
+                noise_target = np.random.uniform(-2, 2, kernel_width)
+                noise_ref1 = np.random.uniform(-2, 2, kernel_width)
+                noise_ref2 = np.random.uniform(-2, 2, kernel_width)
+                
+                for i in range(core_width):
+                    kernel_target[core_start + i, :] += noise_target
+                    kernel_ref1[core_start + i, :] += noise_ref1
+                    kernel_ref2[core_start + i, :] += noise_ref2
+                
+                # Apply Gaussian blur to create soft edges (1 pixel expansion)
+                # Smaller sigma for less intensity loss
+                sigma_y = 0.3  # Reduced for better intensity preservation
+                sigma_x = 0.05  # Very minimal blur along line
+                
+                kernel_target = gaussian_filter(kernel_target, sigma=(sigma_y, sigma_x))
+                kernel_ref1 = gaussian_filter(kernel_ref1, sigma=(sigma_y, sigma_x))
+                kernel_ref2 = gaussian_filter(kernel_ref2, sigma=(sigma_y, sigma_x))
+                
+                # Scale up after blur to compensate for intensity loss
+                # Find peak value and scale to maintain brightness
+                peak_target = np.max(kernel_target)
+                peak_ref1 = np.max(kernel_ref1)
+                peak_ref2 = np.max(kernel_ref2)
+                
+                if peak_target > 0:
+                    kernel_target = kernel_target * (base_intensity / peak_target)
+                if peak_ref1 > 0:
+                    kernel_ref1 = kernel_ref1 * ((base_intensity + np.random.uniform(-10, 10)) / peak_ref1)
+                if peak_ref2 > 0:
+                    kernel_ref2 = kernel_ref2 * ((base_intensity + np.random.uniform(-10, 10)) / peak_ref2)
+                
+                # Add subtle edge variations
+                edge_var_target = np.random.uniform(-3, 3, (kernel_height, kernel_width))
+                edge_var_ref1 = np.random.uniform(-3, 3, (kernel_height, kernel_width))
+                edge_var_ref2 = np.random.uniform(-3, 3, (kernel_height, kernel_width))
+                
+                # Apply edge variations only to the transition zone (not core)
+                edge_mask = (kernel_target > base_intensity * 0.3) & (kernel_target < base_intensity * 0.9)
+                kernel_target[edge_mask] += edge_var_target[edge_mask]
+                kernel_ref1[edge_mask] += edge_var_ref1[edge_mask]
+                kernel_ref2[edge_mask] += edge_var_ref2[edge_mask]
+                
+                # Add tiny spot variations on the line (2-4 pixel spots)
+                # These create realistic t-r variations
+                num_spots = np.random.randint(3, 8)  # Add 3-8 tiny spots
+                for _ in range(num_spots):
+                    # Random spot size (2-4 pixels)
+                    spot_size = np.random.randint(2, 5)
+                    
+                    # Random position along the horizontal line
+                    spot_x = np.random.randint(0, max(1, kernel_width - spot_size))
+                    spot_y = np.random.randint(0, max(1, kernel_height - spot_size))
+                    
+                    # Very subtle intensity variation (±5-10 from line intensity)
+                    spot_intensity_target = np.random.uniform(-8, 8)
+                    spot_intensity_ref1 = np.random.uniform(-8, 8)
+                    spot_intensity_ref2 = np.random.uniform(-8, 8)
+                    
+                    # Apply spot only where line exists (brightness > 20)
+                    for i in range(spot_size):
+                        for j in range(spot_size):
+                            if spot_y+i < kernel_height and spot_x+j < kernel_width:
+                                if kernel_target[spot_y+i, spot_x+j] > 20:
+                                    kernel_target[spot_y+i, spot_x+j] += spot_intensity_target
+                                    kernel_ref1[spot_y+i, spot_x+j] += spot_intensity_ref1
+                                    kernel_ref2[spot_y+i, spot_x+j] += spot_intensity_ref2
+                
+                # Add kernels to the image
+                target[y_pos:y_pos+kernel_height, :] += kernel_target
+                ref1[y_pos:y_pos+kernel_height, :] += kernel_ref1
+                ref2[y_pos:y_pos+kernel_height, :] += kernel_ref2
+                
+            else:
+                # Create small kernel for vertical line
+                kernel_height = h
+                kernel_width = core_width + 4  # Extra space for blur
+                
+                # Random X position
+                x_pos = np.random.randint(2, w - kernel_width - 2)
+                
+                # Record line position (vertical line: x range with safety margin)
+                line_positions.append({
+                    'type': 'vertical',
+                    'x_start': max(0, x_pos - 3),  # 3 pixel safety margin
+                    'x_end': min(w, x_pos + kernel_width + 3)
+                })
+                
+                # Create kernels for each channel
+                kernel_target = np.zeros((kernel_height, kernel_width), dtype=np.float32)
+                kernel_ref1 = np.zeros((kernel_height, kernel_width), dtype=np.float32)
+                kernel_ref2 = np.zeros((kernel_height, kernel_width), dtype=np.float32)
+                
+                # Fill core with base intensity + channel variations
+                core_start = 2  # Start after margin
+                for i in range(core_width):
+                    # Each channel gets slightly different intensity
+                    kernel_target[:, core_start + i] = base_intensity + np.random.uniform(-10, 10)
+                    kernel_ref1[:, core_start + i] = base_intensity + np.random.uniform(-10, 10)
+                    kernel_ref2[:, core_start + i] = base_intensity + np.random.uniform(-10, 10)
+                
+                # Add slight pixel-level variation along the line
+                noise_target = np.random.uniform(-2, 2, kernel_height)
+                noise_ref1 = np.random.uniform(-2, 2, kernel_height)
+                noise_ref2 = np.random.uniform(-2, 2, kernel_height)
+                
+                for i in range(core_width):
+                    kernel_target[:, core_start + i] += noise_target
+                    kernel_ref1[:, core_start + i] += noise_ref1
+                    kernel_ref2[:, core_start + i] += noise_ref2
+                
+                # Apply Gaussian blur to create soft edges (1 pixel expansion)
+                # Smaller sigma for less intensity loss
+                sigma_x = 0.3  # Reduced for better intensity preservation
+                sigma_y = 0.05  # Very minimal blur along line
+                
+                kernel_target = gaussian_filter(kernel_target, sigma=(sigma_y, sigma_x))
+                kernel_ref1 = gaussian_filter(kernel_ref1, sigma=(sigma_y, sigma_x))
+                kernel_ref2 = gaussian_filter(kernel_ref2, sigma=(sigma_y, sigma_x))
+                
+                # Scale up after blur to compensate for intensity loss
+                # Find peak value and scale to maintain brightness
+                peak_target = np.max(kernel_target)
+                peak_ref1 = np.max(kernel_ref1)
+                peak_ref2 = np.max(kernel_ref2)
+                
+                if peak_target > 0:
+                    kernel_target = kernel_target * (base_intensity / peak_target)
+                if peak_ref1 > 0:
+                    kernel_ref1 = kernel_ref1 * ((base_intensity + np.random.uniform(-10, 10)) / peak_ref1)
+                if peak_ref2 > 0:
+                    kernel_ref2 = kernel_ref2 * ((base_intensity + np.random.uniform(-10, 10)) / peak_ref2)
+                
+                # Add subtle edge variations
+                edge_var_target = np.random.uniform(-3, 3, (kernel_height, kernel_width))
+                edge_var_ref1 = np.random.uniform(-3, 3, (kernel_height, kernel_width))
+                edge_var_ref2 = np.random.uniform(-3, 3, (kernel_height, kernel_width))
+                
+                # Apply edge variations only to the transition zone (not core)
+                edge_mask = (kernel_target > base_intensity * 0.3) & (kernel_target < base_intensity * 0.9)
+                kernel_target[edge_mask] += edge_var_target[edge_mask]
+                kernel_ref1[edge_mask] += edge_var_ref1[edge_mask]
+                kernel_ref2[edge_mask] += edge_var_ref2[edge_mask]
+                
+                # Add tiny spot variations on the line (2-4 pixel spots)
+                # These create realistic t-r variations
+                num_spots = np.random.randint(3, 8)  # Add 3-8 tiny spots
+                for _ in range(num_spots):
+                    # Random spot size (2-4 pixels)
+                    spot_size = np.random.randint(2, 5)
+                    
+                    # Random position along the vertical line
+                    spot_x = np.random.randint(0, max(1, kernel_width - spot_size))
+                    spot_y = np.random.randint(0, max(1, kernel_height - spot_size))
+                    
+                    # Very subtle intensity variation (±5-10 from line intensity)
+                    spot_intensity_target = np.random.uniform(-8, 8)
+                    spot_intensity_ref1 = np.random.uniform(-8, 8)
+                    spot_intensity_ref2 = np.random.uniform(-8, 8)
+                    
+                    # Apply spot only where line exists (brightness > 20)
+                    for i in range(spot_size):
+                        for j in range(spot_size):
+                            if spot_y+i < kernel_height and spot_x+j < kernel_width:
+                                if kernel_target[spot_y+i, spot_x+j] > 20:
+                                    kernel_target[spot_y+i, spot_x+j] += spot_intensity_target
+                                    kernel_ref1[spot_y+i, spot_x+j] += spot_intensity_ref1
+                                    kernel_ref2[spot_y+i, spot_x+j] += spot_intensity_ref2
+                
+                # Add kernels to the image
+                target[:, x_pos:x_pos+kernel_width] += kernel_target
+                ref1[:, x_pos:x_pos+kernel_width] += kernel_ref1
+                ref2[:, x_pos:x_pos+kernel_width] += kernel_ref2
         
-        # Based on testing:
-        # - Single defects: ~0.1% edge ratio
-        # - Multiple defects (5-8): ~0.5-0.7% edge ratio  
-        # - Grid/stripe structures: >9% edge ratio
-        # Using 2% threshold provides safe margin
+        # Clip to valid range
+        target = np.clip(target, 0, 255)
+        ref1 = np.clip(ref1, 0, 255)
+        ref2 = np.clip(ref2, 0, 255)
         
-        return edge_ratio > edge_ratio_threshold
+        if return_positions:
+            return target, ref1, ref2, line_positions
+        else:
+            return target, ref1, ref2
+    
+    def _generate_point_defect_params(self, h, w, num_defects=None):
+        """
+        Generate parameters for point defects.
+        Extracted from original defect generation logic.
+        """
+        if num_defects is None:
+            num_defects = np.random.randint(self.num_defects_range[0], self.num_defects_range[1] + 1)
+        
+        defect_params = []
+        for i in range(num_defects):
+            # Random position in patch
+            margin = 5
+            cx = np.random.randint(margin, w - margin)
+            cy = np.random.randint(margin, h - margin)
+            
+            # Random size (3x3 or 3x5)
+            if np.random.rand() > 0.5:
+                size = (3, 3)
+                sigma = 1.3
+            else:
+                size = (3, 5)
+                sigma = (2.0, 1.5)  # (sigma_x, sigma_y)
+            
+            # Random intensity
+            intensity = np.random.choice([-80, -60, 60, 80])
+            
+            defect_params.append({
+                'center': (cx, cy),
+                'size': size,
+                'sigma': sigma,
+                'intensity': intensity,
+                'id': i
+            })
+        
+        return defect_params
+    
+    def _generate_point_defect_params_avoiding_lines(self, h, w, line_positions, num_defects=None):
+        """
+        Generate parameters for point defects, avoiding line positions.
+        Uses line_positions list to ensure defects are at least 3 pixels away from lines.
+        """
+        if num_defects is None:
+            num_defects = np.random.randint(self.num_defects_range[0], self.num_defects_range[1] + 1)
+        
+        defect_params = []
+        for i in range(num_defects):
+            # Try to find a good position (not near lines)
+            max_attempts = 30  # Maximum attempts to find a valid spot
+            valid_position = False
+            
+            for attempt in range(max_attempts):
+                # Random position in patch
+                margin = 5
+                cx = np.random.randint(margin, w - margin)
+                cy = np.random.randint(margin, h - margin)
+                
+                # Check if this position is too close to any line
+                too_close = False
+                for line in line_positions:
+                    if line['type'] == 'horizontal':
+                        # Check if y coordinate is within line's range
+                        if line['y_start'] <= cy <= line['y_end']:
+                            too_close = True
+                            break
+                    else:  # vertical line
+                        # Check if x coordinate is within line's range
+                        if line['x_start'] <= cx <= line['x_end']:
+                            too_close = True
+                            break
+                
+                if not too_close:
+                    valid_position = True
+                    break
+            
+            # If we couldn't find a valid position after many attempts,
+            # use the last position anyway (rare case)
+            if not valid_position:
+                # Try to find a position as far as possible from lines
+                # This is a fallback and should rarely happen
+                pass
+            
+            # Random size (3x3 or 3x5)
+            if np.random.rand() > 0.5:
+                size = (3, 3)
+                sigma = 1.3
+            else:
+                size = (3, 5)
+                sigma = (2.0, 1.5)
+            
+            # Random intensity
+            intensity = np.random.choice([-80, -60, 60, 80])
+            
+            defect_params.append({
+                'center': (cx, cy),
+                'size': size,
+                'sigma': sigma,
+                'intensity': intensity,
+                'id': i
+            })
+        
+        return defect_params
+    
+    def _detect_real_lines(self, image, min_line_length=30):
+        """
+        Detect real horizontal and vertical lines in the image using Canny + Hough Line.
+        Returns line positions in the same format as _add_line_variations.
+        """
+        # Convert to uint8 if needed
+        if image.dtype != np.uint8:
+            image_uint8 = np.clip(image, 0, 255).astype(np.uint8)
+        else:
+            image_uint8 = image
+        
+        # Canny edge detection
+        edges = cv2.Canny(image_uint8, threshold1=30, threshold2=100)
+        
+        # Hough Line detection for line segments
+        lines = cv2.HoughLinesP(
+            edges,
+            rho=1,
+            theta=np.pi/180,
+            threshold=50,
+            minLineLength=min_line_length,  # Minimum line length
+            maxLineGap=5  # Maximum gap between line segments
+        )
+        
+        line_positions = []
+        if lines is not None:
+            for line in lines:
+                x1, y1, x2, y2 = line[0]
+                
+                # Calculate line angle
+                angle = np.abs(np.arctan2(y2 - y1, x2 - x1) * 180 / np.pi)
+                
+                # Check if line is horizontal (angle close to 0 or 180)
+                if angle < 10 or angle > 170:
+                    # Horizontal line
+                    y_min = min(y1, y2)
+                    y_max = max(y1, y2)
+                    line_positions.append({
+                        'type': 'horizontal',
+                        'y_start': max(0, y_min - 3),  # 3 pixel safety margin
+                        'y_end': min(image.shape[0], y_max + 3)
+                    })
+                
+                # Check if line is vertical (angle close to 90)
+                elif 80 < angle < 100:
+                    # Vertical line
+                    x_min = min(x1, x2)
+                    x_max = max(x1, x2)
+                    line_positions.append({
+                        'type': 'vertical',
+                        'x_start': max(0, x_min - 3),  # 3 pixel safety margin
+                        'x_end': min(image.shape[1], x_max + 3)
+                    })
+        
+        return line_positions
+    
+    def _apply_defects_with_contrastive_learning(self, target, ref1, ref2, defect_params):
+        """
+        Apply defects using three-channel contrastive learning strategy.
+        Extracted from original defect generation logic.
+        Returns modified channels and GT mask (only for target-only defects).
+        """
+        h, w = target.shape
+        num_defects = len(defect_params)
+        
+        # Step 1: Ensure at least 1-2 target-only defects
+        num_target_only = np.random.randint(1, min(3, num_defects // 2 + 1))
+        target_only_ids = set(np.random.choice(num_defects, num_target_only, replace=False))
+        
+        # Step 2: Allocate remaining defects to maximize contrastive signal
+        remaining_ids = list(set(range(num_defects)) - target_only_ids)
+        np.random.shuffle(remaining_ids)
+        
+        # Initialize sets
+        only_ref1_ids = set()
+        only_ref2_ids = set()
+        both_refs_ids = set()
+        
+        # Distribute remaining defects to ensure ref1 != ref2
+        if len(remaining_ids) >= 2:
+            n_remaining = len(remaining_ids)
+            n_only_ref1 = n_remaining // 3
+            n_only_ref2 = n_remaining // 3
+            
+            only_ref1_ids = set(remaining_ids[:n_only_ref1])
+            only_ref2_ids = set(remaining_ids[n_only_ref1:n_only_ref1 + n_only_ref2])
+            both_refs_ids = set(remaining_ids[n_only_ref1 + n_only_ref2:])
+        elif len(remaining_ids) == 1:
+            if np.random.rand() < 0.5:
+                only_ref1_ids = set(remaining_ids)
+            else:
+                only_ref2_ids = set(remaining_ids)
+        
+        # Build removal sets
+        remove_ref1 = target_only_ids | only_ref2_ids
+        remove_ref2 = target_only_ids | only_ref1_ids
+        
+        # Initialize ground truth mask
+        gt_mask = np.zeros((h, w), dtype=np.float32)
+        
+        # Apply defects
+        for i, params in enumerate(defect_params):
+            # Generate defect
+            local_defect, bounds = create_local_gaussian_defect(
+                center=params['center'],
+                size=params['size'],
+                sigma=params['sigma'],
+                patch_shape=(h, w),
+                patch_offset=(0, 0)
+            )
+            
+            if local_defect is None:
+                continue
+            
+            intensity = params['intensity']
+            
+            # Target always gets the defect
+            target = apply_local_defect_to_background(target, local_defect, bounds, intensity)
+            
+            # Ref1: only if not in remove_ref1
+            if i not in remove_ref1:
+                ref1 = apply_local_defect_to_background(ref1, local_defect, bounds, intensity)
+            
+            # Ref2: only if not in remove_ref2
+            if i not in remove_ref2:
+                ref2 = apply_local_defect_to_background(ref2, local_defect, bounds, intensity)
+            
+            # Ground truth mask: only if this is a target-only defect
+            if i in target_only_ids:
+                local_mask = create_binary_mask(local_defect, threshold=0.1)
+                y_start, y_end, x_start, x_end = bounds
+                gt_mask[y_start:y_end, x_start:x_end] = np.maximum(
+                    gt_mask[y_start:y_end, x_start:x_end],
+                    local_mask
+                )
+        
+        return target, ref1, ref2, gt_mask
+    
+    def _generate_line_with_point_defects(self, target_channel, ref1_channel, ref2_channel):
+        """
+        Combine line variations with point defects.
+        Lines simulate background stripe patterns (not defects).
+        Point defects use three-channel contrastive learning.
+        GT mask only contains target-only point defects.
+        IMPORTANT: Defects avoid bright lines by checking brightness.
+        """
+        # Step 1: Create copies for modification
+        target = target_channel.copy()
+        ref1 = ref1_channel.copy()
+        ref2 = ref2_channel.copy()
+        
+        # Step 2: Add line variations and get line positions
+        target, ref1, ref2, line_positions = self._add_line_variations(target, ref1, ref2, return_positions=True)
+        
+        # Step 3: Generate point defect parameters avoiding lines
+        h, w = target.shape
+        defect_params = self._generate_point_defect_params_avoiding_lines(h, w, line_positions)
+        
+        # Step 4: Apply defects with contrastive learning
+        target, ref1, ref2, gt_mask = self._apply_defects_with_contrastive_learning(
+            target, ref1, ref2, defect_params
+        )
+        
+        return target, ref1, ref2, gt_mask
     
     def _generate_edge_negative_samples(self, target_channel, ref1_channel, ref2_channel):
         """
