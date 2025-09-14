@@ -130,6 +130,7 @@ dataset = Dataset(
    - 新增 img_format 和 use_mask 參數
    - **重要變更**：缺陷數量從原始設計的 5-15 個（整張圖）改為 1-5 個（每個 patch），因應優化後的 patch-based 處理方式
    - **2025年8月更新**：改進缺陷分配策略，從 1-5 個提升到 3-8 個，並實作智慧分配確保對比學習效果
+   - **2025年8-9月更新**：處理條紋偽陽性問題，詳見 [stripe_false_positive_solutions.md](./stripe_false_positive_solutions.md)
 
 ### 專案特色
 
