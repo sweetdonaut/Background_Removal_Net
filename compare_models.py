@@ -476,7 +476,7 @@ def create_summary_stats(results, model1_path, model2_path, output_dir):
 
 def main():
     # Paths
-    model1_path = "./checkpoints/stripe_experiment/BgRemoval_lr0.0001_ep100_bs16_128x128_strip.pth"
+    model1_path = "./checkpoints/line_negative/BgRemoval_lr0.001_ep30_bs16_128x128_strip.pth"
     model2_path = "./checkpoints/line_negative/BgRemoval_lr0.001_ep50_bs16_128x128_strip.pth"
     base_image_path = "./MVTec_AD_dataset/grid_stripe/train/good/250.tiff"
     test_images_dir = "./output/test_images"

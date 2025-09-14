@@ -1,7 +1,7 @@
 python trainer.py \
     --bs 16 \
     --lr 0.001 \
-    --epochs 50 \
+    --epochs 30 \
     --gpu_id 0 \
     --checkpoint_path ./checkpoints/line_negative \
     --image_type strip \
