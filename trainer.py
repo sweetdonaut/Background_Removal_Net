@@ -11,7 +11,7 @@ import random
 from sklearn.metrics import roc_auc_score
 from loss import FocalLoss
 from model import SegmentationNetwork
-from dataloader import Dataset, calculate_positions
+from dataloader_hard_negative import Dataset, calculate_positions
 
 def get_lr(optimizer):
     for param_group in optimizer.param_groups:

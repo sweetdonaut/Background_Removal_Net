@@ -1,12 +1,12 @@
 """
-Test script to visualize the new dataloader with line negative samples
+Test script to visualize the new dataloader with hard negative samples
 """
 import torch
 from torch.utils.data import DataLoader
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
-from dataloader import Dataset
+from dataloader_hard_negative import Dataset
 import os
 
 
@@ -135,6 +135,15 @@ def main():
     
     print(f"\nGenerated {num_batches_to_visualize} batch visualizations")
     print(f"Results saved to: {output_dir}")
+
+    # Print dataset info
+    if hasattr(dataset, 'use_hard_negatives'):
+        print(f"\nHard Negative Info:")
+        print(f"  Use hard negatives: {dataset.use_hard_negatives}")
+        print(f"  Hard negative path: {dataset.hard_negative_path}")
+        if dataset.use_hard_negatives:
+            print(f"  Number of hard negative samples: {len(dataset.hard_negative_paths)}")
+            print(f"  Hard negative ratio: {dataset.hard_negative_ratio}")
 
 
 if __name__ == "__main__":
