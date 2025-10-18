@@ -2,16 +2,19 @@
 
 ## 專案當前狀態
 
-**最後更新**: 2025-01-18
+**最後更新**: 2025-10-18
 
 本專案使用三通道對比學習進行智慧去背，透過 Target、Ref1、Ref2 三個通道的差異訓練 UNet 模型識別目標缺陷。
 
 **當前版本特色**:
 - ✅ 簡潔的點缺陷合成策略
 - ✅ 動態 Focal Loss gamma scheduling
-- ✅ 四通道圖片支援（生產環境需求）
-- ✅ 完整的 ONNX 部署方案
+- ✅ **支援 Strip (976×176) 和 Square (320×320) 兩種圖片格式**
+- ✅ **支援 uint8 和 float32 兩種資料型態**
+- ✅ **自動偵測方形圖片尺寸**
+- ✅ 完整的 ONNX 部署方案（Strip 和 Square 各自獨立）
 - ✅ 效能優化（patch-based processing + image cache）
+- ✅ **腳本分離（strip 和 square 各自獨立的訓練/推理/匯出腳本）**
 
 ---
 
@@ -279,6 +282,8 @@ python inference_onnx.py \
 
 ### 當前使用的資料集
 
+#### 1. Strip 圖片資料集
+
 **grid_stripe_4channel** (TIFF float32 格式)：
 ```
 grid_stripe_4channel/
@@ -292,10 +297,30 @@ grid_stripe_4channel/
 ```
 
 **圖片格式**：
-- 尺寸：976×176
+- 尺寸：976×176 (Strip)
 - 通道：4 通道 (Target, Ref1, Ref2, Mask)
 - 格式：TIFF float32
 - 訓練時只使用前 3 通道
+- Patch 配置：128×128，9 Y × 2 X = 18 patches per image
+
+#### 2. Square 圖片資料集
+
+**grid_align_3channel** (TIFF uint8 格式)：
+```
+grid_align_3channel/
+├── train/
+│   └── good/              # 訓練圖片（3 通道，320×320）
+└── test/
+    ├── good/              # 正常測試圖片
+    └── bright_spots/      # 異常測試圖片（含合成缺陷）
+```
+
+**圖片格式**：
+- 尺寸：320×320 (Square)
+- 通道：3 通道 (Target, Ref1, Ref2)
+- 格式：TIFF uint8
+- 數值範圍：0-255
+- Patch 配置：128×128，3 Y × 3 X = 9 patches per image
 
 詳細說明請參考：@dataset_description.md
 
@@ -303,32 +328,36 @@ grid_stripe_4channel/
 
 ## 使用範例
 
-### 完整訓練到部署流程
+### Strip 圖片完整流程（976×176）
 
 ```bash
 # 1. 訓練模型
-bash train.sh
+bash train_stripe.sh
 
 # 2. PyTorch 推理（測試）
-python inference_pytorch.py \
-    --model_path ./checkpoints/4channel/BgRemoval_lr0.001_ep30_bs16_128x128_strip.pth \
-    --test_path ./MVTec_AD_dataset/grid_stripe_4channel/test/ \
-    --output_dir ./output/pytorch \
-    --img_format tiff \
-    --image_type strip
+bash inference_pytorch_stripe.sh
 
 # 3. 匯出 ONNX（生產部署）
-python export_onnx_fullimage.py \
-    --checkpoint_path ./checkpoints/4channel/BgRemoval_lr0.001_ep30_bs16_128x128_strip.pth \
-    --output_path ./onnx_models/background_removal_fullimage.onnx
+bash export_onnx_stripe.sh
 
 # 4. ONNX 推理（驗證）
-python inference_onnx.py \
-    --model_path ./onnx_models/background_removal_fullimage.onnx \
-    --test_path ./MVTec_AD_dataset/grid_stripe_4channel/test/ \
-    --output_dir ./output/onnx \
-    --img_format tiff \
-    --image_type strip
+bash inference_onnx_stripe.sh
+```
+
+### Square 圖片完整流程（320×320）
+
+```bash
+# 1. 訓練模型
+bash train_square.sh
+
+# 2. PyTorch 推理（測試）
+bash inference_pytorch_square.sh
+
+# 3. 匯出 ONNX（生產部署）
+bash export_onnx_square.sh
+
+# 4. ONNX 推理（驗證）
+bash inference_onnx_square.sh
 ```
 
 ---
@@ -353,28 +382,53 @@ python inference_onnx.py \
 - ✅ ONNX 完整部署方案
 - ✅ 文件整理與歸檔
 
+### 2025 年 10 月 18 日
+- ✅ **新增 Square (320×320) 圖片格式支援**
+- ✅ **移除 mvtec 圖片類型，簡化為 strip/square 兩種**
+- ✅ **支援 uint8 和 float32 兩種資料型態**
+- ✅ **自動偵測方形圖片尺寸**
+- ✅ **新增 SegmentationNetworkONNXSquare 類別**
+- ✅ **Square 圖片的 3×3 patch 配置（positions: [0, 96, 192]）**
+- ✅ **腳本分離：所有功能都有 stripe 和 square 獨立腳本**
+- ✅ **完整的 Square ONNX 匯出和推理功能**
+- ✅ **文件更新與 Git 提交**
+
 ---
 
 ## 專案檔案結構
 
 ```
 Background_Removal_Net/
-├── gaussian.py                    # 高斯缺陷生成
-├── dataloader.py                  # 資料載入（支援 3/4 通道）
-├── model.py                       # UNet + ONNX 包裝
-├── loss.py                        # Focal Loss（支援動態 gamma）
-├── trainer.py                     # 訓練主程式
-├── inference_pytorch.py           # PyTorch 推理
-├── inference_onnx.py              # ONNX 推理
-├── export_onnx_fullimage.py       # ONNX 匯出
-├── train.sh                       # 訓練腳本
-├── inference_pytorch.sh           # PyTorch 推理腳本
-├── inference_onnx.sh              # ONNX 推理腳本
+├── Core Files (核心檔案)
+│   ├── gaussian.py                      # 高斯缺陷生成
+│   ├── dataloader.py                    # 資料載入（支援 strip/square，uint8/float32）
+│   ├── model.py                         # UNet + ONNX 包裝（含 Square/Strip wrapper）
+│   ├── loss.py                          # Focal Loss（支援動態 gamma）
+│   ├── trainer.py                       # 訓練主程式
+│   ├── inference_pytorch.py             # PyTorch 推理（通用）
+│   ├── inference_onnx.py                # ONNX 推理（通用）
+│   └── export_onnx_fullimage.py         # ONNX 匯出（自動判斷 strip/square）
+│
+├── Strip Scripts (Strip 專用腳本 - 976×176)
+│   ├── train_stripe.sh                  # 訓練
+│   ├── export_onnx_stripe.sh            # ONNX 匯出
+│   ├── inference_pytorch_stripe.sh      # PyTorch 推理
+│   └── inference_onnx_stripe.sh         # ONNX 推理
+│
+├── Square Scripts (Square 專用腳本 - 320×320)
+│   ├── train_square.sh                  # 訓練
+│   ├── export_onnx_square.sh            # ONNX 匯出
+│   ├── inference_pytorch_square.sh      # PyTorch 推理
+│   └── inference_onnx_square.sh         # ONNX 推理
+│
+├── Tools (工具腳本)
+│   └── alignment_pipeline.py            # 資料集對齊工具
+│
 └── docs/develop/
-    ├── project_discussion.md      # 專案概念說明
-    ├── development_record.md      # 本文件
-    ├── dataset_description.md     # 資料集說明
-    └── archive/                   # 歷史文件歸檔
+    ├── project_discussion.md            # 專案概念說明
+    ├── development_record.md            # 本文件
+    ├── dataset_description.md           # 資料集說明
+    └── archive/                         # 歷史文件歸檔
 ```
 
 ---
