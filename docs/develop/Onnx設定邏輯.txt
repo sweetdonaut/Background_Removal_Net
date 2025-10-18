@@ -1,0 +1,333 @@
+  🎯 ONNX 打包策略概覽
+
+  我們採用了三層包裝架構，將推理的每個階段逐步封裝進 ONNX 模型：
+
+  Layer 1: SegmentationNetwork (基礎分割)
+      ↓
+  Layer 2: SegmentationNetworkONNX (Patch 級別處理)
+      ↓
+  Layer 3: SegmentationNetworkONNXFullImage (完整圖片處理)
+
+  讓我逐層解釋：
+
+  ---
+  📦 Layer 1: SegmentationNetwork（基礎分割）
+
+  功能：純粹的 UNet 分割網路
+
+● Read(~/vscode_project/Background_Removal_Net/model.py)
+  ⎿  Read 20 lines
+
+● Layer 1 處理：
+  Input:  (B, 3, H, W)  # 三通道 (Target, Ref1, Ref2)
+     ↓
+  UNet Forward
+     ↓
+  Output: (B, 2, H, W)  # 二分類 logits (背景/前景)
+
+  ---
+  📦 Layer 2: SegmentationNetworkONNX（Patch 級別處理）
+
+  功能：為單個 patch 添加後處理
+
+● Read(~/vscode_project/Background_Removal_Net/model.py)
+  ⎿  Read 35 lines
+
+● Layer 2 處理：
+  Input:  (B, 3, 128, 128)  # 單個 patch
+     ↓
+  Base Model (Layer 1)
+     ↓ (B, 2, 128, 128)
+  Softmax
+     ↓ (B, 2, 128, 128) [probabilities]
+  Extract Channel 1 (前景)
+     ↓ (B, 1, 128, 128)
+  Add 2 Zero Channels
+     ↓
+  Output: (B, 3, 128, 128)  # [異常圖, 零, 零]
+
+  為什麼要 3 通道輸出？
+  - 生產環境需求（統一格式）
+  - Channel 0：異常 heatmap（實際使用）
+  - Channel 1-2：預留擴展空間
+
+  ---
+  📦 Layer 3: SegmentationNetworkONNXFullImage（完整圖片處理）
+
+  這是關鍵！ 將分割、滑動窗口、拼接全部封裝進 ONNX
+
+● Read(~/vscode_project/Background_Removal_Net/model.py)
+  ⎿  Read 116 lines
+
+● Layer 3 處理（完整圖片）：
+
+  Input: (1, 3, 976, 176)  # 完整 strip 圖片
+     ↓
+  初始化輸出 heatmap (1, 1, 976, 176) = 全零
+     ↓
+  for y_idx in 9 個 Y 位置:
+      for x_idx in 2 個 X 位置:
+          1. 提取 patch (1, 3, 128, 128)
+             ↓
+          2. Patch Model (Layer 2)
+             ↓ (1, 3, 128, 128)
+          3. 取 Channel 0
+             ↓ (1, 1, 128, 128)
+          4. 智慧裁切（中心區域拼接策略）
+             - 第一個 patch：保留頂部
+             - 中間 patches：只用中心
+             - 最後 patch：保留底部
+             ↓
+          5. 放入對應位置（無縫拼接）
+     ↓
+  完整 heatmap (1, 1, 976, 176)
+     ↓
+  加入 2 個零通道
+     ↓
+  Output: (1, 3, 976, 176)  # [異常圖, 零, 零]
+
+  ---
+  🔧 ONNX 匯出流程
+
+  完整匯出腳本（export_onnx_fullimage.py）：
+
+  # 1. 載入訓練好的 checkpoint
+  checkpoint = torch.load(checkpoint_path)
+
+  # 2. 創建 Layer 1 (基礎模型)
+  base_model = SegmentationNetwork(in_channels=3, out_channels=2)
+  base_model.load_state_dict(checkpoint['model_state_dict'])
+
+  # 3. 包裝成 Layer 2 (Patch 級別)
+  patch_onnx_model = SegmentationNetworkONNX(base_model)
+
+  # 4. 包裝成 Layer 3 (Full Image)
+  full_image_model = SegmentationNetworkONNXFullImage(patch_onnx_model)
+
+  # 5. 準備 dummy input
+  dummy_input = torch.randn(1, 3, 976, 176)
+
+  # 6. 匯出 ONNX
+  torch.onnx.export(
+      full_image_model,      # 模型（Layer 3，包含所有邏輯）
+      dummy_input,           # 範例輸入
+      output_path,           # 輸出檔案路徑
+      export_params=True,    # 匯出參數
+      opset_version=11,      # ONNX opset 版本
+      input_names=['input'],
+      output_names=['output'],
+      dynamic_axes={         # 允許 batch size 動態
+          'input': {0: 'batch_size'},
+          'output': {0: 'batch_size'}
+      }
+  )
+
+  發生了什麼？
+
+  當執行 torch.onnx.export() 時：
+  1. PyTorch 會用 dummy_input 執行一次 forward()
+  2. 記錄所有操作（包括 for 迴圈、if 條件、裁切、拼接）
+  3. 將這些操作轉換成 ONNX 計算圖
+  4. 所有邏輯都被「展開」並嵌入 ONNX 檔案
+
+  結果：
+  - ✅ 9×2 個 patch 的提取邏輯 → ONNX
+  - ✅ 18 次模型推理 → ONNX
+  - ✅ 智慧裁切與拼接 → ONNX
+  - ✅ Softmax 和通道轉換 → ONNX
+
+  一切都在 ONNX 檔案裡！
+
+  ---
+  📖 ONNX 模型讀取與使用
+
+  方法 1：使用 ONNX Runtime（Python）
+
+● Read(~/vscode_project/Background_Removal_Net/inference_onnx.py)
+  ⎿  Read 40 lines
+
+● 完整的使用範例：
+
+  import onnxruntime as ort
+  import numpy as np
+  import tifffile
+
+  # 1. 載入 ONNX 模型
+  ort_session = ort.InferenceSession("model_fullimage.onnx")
+
+  # 2. 載入圖片
+  image = tifffile.imread("test_image.tiff")  # (4, 976, 176) 或 (3, 976, 176)
+
+  # 3. 前處理
+  # 轉換格式：CHW → HWC
+  if image.shape[0] in [3, 4]:
+      image = np.transpose(image, (1, 2, 0))  # (976, 176, 3 或 4)
+
+  # 只保留前 3 通道
+  if image.shape[2] == 4:
+      image = image[:, :, :3]  # (976, 176, 3)
+
+  # 4. 準備輸入：HWC → CHW + 正規化 + batch dimension
+  three_channel = np.stack([image[:,:,0], image[:,:,1], image[:,:,2]], axis=0)
+  input_tensor = (three_channel / 255.0).astype(np.float32)
+  input_tensor = np.expand_dims(input_tensor, 0)  # (1, 3, 976, 176)
+
+  # 5. ONNX 推理 - 一次呼叫處理完整圖片！
+  outputs = ort_session.run(None, {'input': input_tensor})
+  output = outputs[0]  # (1, 3, 976, 176)
+
+  # 6. 提取結果
+  anomaly_heatmap = output[0, 0, :, :]  # (976, 176) - Channel 0
+  # output[0, 1, :, :] 全是 0
+  # output[0, 2, :, :] 全是 0
+
+  # 7. 使用 heatmap
+  import matplotlib.pyplot as plt
+  plt.imshow(anomaly_heatmap, cmap='hot')
+  plt.colorbar()
+  plt.show()
+
+  ---
+  🔍 內部流程圖解
+
+  讓我畫一個完整的流程圖：
+
+  === ONNX 模型內部（全自動） ===
+
+  輸入圖片 (1, 3, 976, 176)
+           │
+           ├─────────────────────────────────────┐
+           │                                     │
+      Patch 1 (0, 0)                        Patch 18 (848, 48)
+      (1,3,128,128)                         (1,3,128,128)
+           │                                     │
+      ┌────▼────┐                           ┌────▼────┐
+      │ Layer 2 │                           │ Layer 2 │
+      │ Patch   │                           │ Patch   │
+      │ Model   │                           │ Model   │
+      └────┬────┘                           └────┬────┘
+           │(1,3,128,128)                        │(1,3,128,128)
+           │ Ch0: heatmap                        │ Ch0: heatmap
+           │                                     │
+      ┌────▼──────┐                         ┌────▼──────┐
+      │智慧裁切    │                         │智慧裁切    │
+      │保留頂部    │                         │保留底部    │
+      │117 pixels │                         │117 pixels │
+      └────┬──────┘                         └────┬──────┘
+           │                                     │
+           └─────────────┬───────────────────────┘
+                         │
+                     無縫拼接
+                         │
+                         ▼
+                完整 Heatmap
+                (1, 1, 976, 176)
+                         │
+                    加入零通道
+                         │
+                         ▼
+                輸出 (1, 3, 976, 176)
+                - Ch0: 異常圖 ✓
+                - Ch1: 零
+                - Ch2: 零
+
+  ---
+  💡 關鍵理解
+
+  1. 所有邏輯都在 ONNX 裡
+
+  # 外部使用時，不需要：
+  ❌ 手動切割 patches
+  ❌ 迴圈處理每個 patch
+  ❌ 手動拼接結果
+  ❌ 計算裁切位置
+
+  # 只需要：
+  ✅ 載入圖片
+  ✅ 前處理（轉格式 + 正規化）
+  ✅ 一次推理呼叫
+  ✅ 取出 Channel 0
+
+  2. 為什麼這樣設計？
+
+  生產環境的考量：
+  方案 A（傳統）：
+  Python 腳本
+    ├─ 切割 18 個 patches
+    ├─ 18 次 ONNX 呼叫
+    ├─ Python 拼接邏輯
+    └─ 輸出
+
+  問題：
+  ❌ 需要維護 Python 程式碼
+  ❌ Python/C++ 跨語言呼叫開銷
+  ❌ 部署複雜
+
+  方案 B（我們的）：
+  單一 ONNX 檔案
+    └─ 一次呼叫完成所有事
+
+  優點：
+  ✅ 簡單：只是個檔案
+  ✅ 快速：內部優化
+  ✅ 跨平台：ONNX Runtime 支援多語言
+
+  3. 檔案內容
+
+  ONNX 檔案包含：
+  - ✅ 所有模型權重
+  - ✅ Patch 位置（hardcoded: [0, 106, 212, ...]）
+  - ✅ 裁切邏輯（if y_idx == 0: ...）
+  - ✅ 拼接邏輯（output[y_start:y_end, ...] = patch）
+  - ✅ Softmax、通道轉換
+
+  實際上是一個完整的推理引擎！
+
+  ---
+  🔧 其他語言使用範例
+
+  C++ 範例
+
+  #include <onnxruntime_cxx_api.h>
+
+  // 1. 建立 session
+  Ort::Env env;
+  Ort::SessionOptions session_options;
+  Ort::Session session(env, "model_fullimage.onnx", session_options);
+
+  // 2. 準備輸入
+  std::vector<float> input_data(1 * 3 * 976 * 176);
+  // ... 填入資料 ...
+
+  std::vector<int64_t> input_shape = {1, 3, 976, 176};
+  auto input_tensor = Ort::Value::CreateTensor<float>(
+      memory_info, input_data.data(), input_data.size(),
+      input_shape.data(), input_shape.size()
+  );
+
+  // 3. 推理
+  auto output_tensors = session.Run(
+      Ort::RunOptions{nullptr},
+      input_names, &input_tensor, 1,
+      output_names, 1
+  );
+
+  // 4. 取得結果
+  float* output_data = output_tensors[0].GetTensorMutableData<float>();
+  // output_data[0 * 976 * 176 : 1 * 976 * 176] 是 Channel 0
+
+  ---
+  📊 效能比較
+
+  | 項目         | 傳統方案            | 我們的方案   |
+  |------------|-----------------|---------|
+  | ONNX 呼叫次數  | 18 次            | 1 次     |
+  | Python 程式碼 | ~200 行          | ~10 行   |
+  | 跨語言開銷      | 18 次            | 1 次     |
+  | 部署複雜度      | 中等              | 極低      |
+  | 維護成本       | 需同步 Python/ONNX | 只需 ONNX |
+
+  ---
+
+
+

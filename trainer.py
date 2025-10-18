@@ -11,11 +11,33 @@ import random
 from sklearn.metrics import roc_auc_score
 from loss import FocalLoss
 from model import SegmentationNetwork
-from dataloader_hard_negative import Dataset, calculate_positions
+from dataloader import Dataset, calculate_positions
 
 def get_lr(optimizer):
     for param_group in optimizer.param_groups:
         return param_group['lr']
+
+def get_focal_gamma(epoch, total_epochs, gamma_start, gamma_end, schedule='cosine'):
+    """
+    Calculate gamma value for current epoch using cosine schedule
+    Args:
+        epoch: current epoch (0-indexed)
+        total_epochs: total number of epochs
+        gamma_start: initial gamma value
+        gamma_end: final gamma value
+        schedule: 'linear' or 'cosine'
+    Returns:
+        current gamma value
+    """
+    if schedule == 'linear':
+        gamma = gamma_start + (gamma_end - gamma_start) * (epoch / total_epochs)
+    elif schedule == 'cosine':
+        import math
+        progress = epoch / total_epochs
+        gamma = gamma_start + (gamma_end - gamma_start) * (1 - math.cos(progress * math.pi)) / 2
+    else:
+        raise ValueError(f"Unknown schedule: {schedule}")
+    return gamma
 
 def evaluate_model(model, valid_root, ground_truth_root, img_format, patch_size, device, image_type):
     """
@@ -64,9 +86,15 @@ def evaluate_model(model, valid_root, ground_truth_root, img_format, patch_size,
                     continue
                 
                 # Convert from CHW to HWC format for stripe dataset
-                if image_type == 'strip' and image.shape[0] == 3:
+                # Support both 3-channel and 4-channel images (4th channel is mask, ignored)
+                if image_type == 'strip' and (image.shape[0] == 3 or image.shape[0] == 4):
                     image = np.transpose(image, (1, 2, 0))
-                    
+
+                # Keep only first 3 channels (target, ref1, ref2)
+                # If 4-channel image, discard the 4th mask channel
+                if len(image.shape) == 3 and image.shape[2] == 4:
+                    image = image[:, :, :3]
+
                 h, w = image.shape[:2]
                 
                 # Skip if image is too small
@@ -215,9 +243,9 @@ def train_on_device(args):
         last_epoch=-1
     )
     
-    # Initialize loss function
-    criterion = FocalLoss()
-    print("Using Focal Loss")
+    # Initialize loss function with alpha=0.75 for defect class balance
+    criterion = FocalLoss(alpha=0.75, gamma=args.gamma_start)
+    print(f"Using Focal Loss with alpha=0.75, gamma schedule: [{args.gamma_start}, {args.gamma_end}] (cosine)")
     
     dataset = Dataset(
         training_path=args.training_dataset_path,
@@ -234,8 +262,12 @@ def train_on_device(args):
     num_batches = len(dataloader)
     
     for epoch in range(args.epochs):
+        # Update focal loss gamma for current epoch
+        current_gamma = get_focal_gamma(epoch, args.epochs, args.gamma_start, args.gamma_end, schedule='cosine')
+        criterion.update_params(gamma=current_gamma)
+
         epoch_loss = 0.0
-        
+
         for i_batch, sample_batched in enumerate(dataloader):
             # Get three channel input and mask
             three_channel_input = sample_batched["three_channel_input"].to(device)
@@ -265,7 +297,7 @@ def train_on_device(args):
         
         # Print epoch summary
         avg_loss = epoch_loss / num_batches
-        print(f'\nEpoch [{epoch+1}/{args.epochs}] Summary - Avg Loss: {avg_loss:.4e}', end='')
+        print(f'\nEpoch [{epoch+1}/{args.epochs}] Summary - Avg Loss: {avg_loss:.4e} - Gamma: {current_gamma:.3f}', end='')
         
         # Evaluate on validation set if use_mask is True
         if args.use_mask == 'True':
@@ -308,7 +340,7 @@ def main():
     parser.add_argument('--checkpoint_path', action='store', type=str, required=True, help='Path to save checkpoints')
     parser.add_argument('--image_type', action='store', type=str, choices=['strip', 'square', 'mvtec'], 
                         default='mvtec', help='Image type: strip (128x128), square/mvtec (256x256)')
-    parser.add_argument('--num_defects_range', action='store', type=int, nargs=2, default=[5, 15],
+    parser.add_argument('--num_defects_range', action='store', type=int, nargs=2, default=[3, 8],
                         help='Range of number of defects to generate [min, max]')
     parser.add_argument('--training_dataset_path', action='store', type=str, required=True,
                         help='Path to training dataset directory (e.g., ./MVTec_AD_dataset/grid/train/good/)')
@@ -320,7 +352,11 @@ def main():
                         help='Random seed for reproducibility')
     parser.add_argument('--cache_size', type=int, default=0,
                         help='Number of images to cache in memory (0 = no cache)')
-    
+    parser.add_argument('--gamma_start', type=float, default=1.0,
+                        help='Starting gamma value for focal loss (default: 1.0)')
+    parser.add_argument('--gamma_end', type=float, default=3.0,
+                        help='Ending gamma value for focal loss (default: 3.0)')
+
     args = parser.parse_args()
     
     train_on_device(args)

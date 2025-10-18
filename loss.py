@@ -30,6 +30,13 @@ class FocalLoss(nn.Module):
             if self.smooth < 0 or self.smooth > 1.0:
                 raise ValueError('smooth value should be in [0,1]')
 
+    def update_params(self, alpha=None, gamma=None):
+        """Update focal loss parameters dynamically"""
+        if alpha is not None:
+            self.alpha = alpha
+        if gamma is not None:
+            self.gamma = gamma
+
     def forward(self, logit, target):
         if self.apply_nonlin is not None:
             logit = self.apply_nonlin(logit)

@@ -57,9 +57,15 @@ class InferenceDataset(Dataset):
             # Keep as uint8, will convert when normalizing
         
         # Convert from CHW to HWC format for stripe dataset
-        if self.image_type == 'strip' and image.shape[0] == 3:
+        # Support both 3-channel and 4-channel images (4th channel is mask, ignored)
+        if self.image_type == 'strip' and (image.shape[0] == 3 or image.shape[0] == 4):
             image = np.transpose(image, (1, 2, 0))
-        
+
+        # Keep only first 3 channels (target, ref1, ref2)
+        # If 4-channel image, discard the 4th mask channel
+        if len(image.shape) == 3 and image.shape[2] == 4:
+            image = image[:, :, :3]
+
         # Store original image and info
         original_h, original_w = image.shape[:2]
         
@@ -351,10 +357,22 @@ def inference(args):
             image, model, patch_size, device, image_type
         )
         
-        # Save visualization
+        # Save visualization (preserve subfolder structure)
         filename = os.path.basename(img_path).split('.')[0]
-        output_path = os.path.join(args.output_dir, f'{filename}_result.png')
-        
+
+        # Extract subfolder from image path (e.g., 'bright_spots', 'good')
+        relative_path = os.path.relpath(img_path, args.test_path)
+        subfolder = os.path.dirname(relative_path)
+
+        # Create output subfolder if needed
+        if subfolder:
+            output_subfolder = os.path.join(args.output_dir, subfolder)
+            os.makedirs(output_subfolder, exist_ok=True)
+            output_path = os.path.join(output_subfolder, f'{filename}_result.png')
+        else:
+            os.makedirs(args.output_dir, exist_ok=True)
+            output_path = os.path.join(args.output_dir, f'{filename}_result.png')
+
         visualize_results(processed_image, heatmap, output_path)
         print(f"Saved result: {output_path}")
             

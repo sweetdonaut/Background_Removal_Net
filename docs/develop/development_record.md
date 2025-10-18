@@ -1,165 +1,403 @@
-# 修改記錄：從 DRAEM 到 Background Removal Net
+# Background Removal Net 開發記錄
 
-## 一、Model 相關修改
+## 專案當前狀態
 
-### 1.1 model.py 實作
-基於 DRAEM 的 `DiscriminativeSubNetwork` 架構，實作了 `SegmentationNetwork`：
+**最後更新**: 2025-01-18
 
-**主要特點**：
-- 輸入通道：3 通道（target, ref1, ref2）
-- 輸出通道：2 通道（背景和前景的二分類）
-- 基礎架構：UNet with skip connections
-- Base channels：64
+本專案使用三通道對比學習進行智慧去背，透過 Target、Ref1、Ref2 三個通道的差異訓練 UNet 模型識別目標缺陷。
 
-**網路結構**：
-1. **Encoder (EncoderSegmentation)**：
-   - 6 個 block，每個包含兩個 Conv2d + BatchNorm + ReLU
-   - 5 次 MaxPool2d 進行下採樣
-   - 通道數變化：3 → 64 → 128 → 256 → 512 → 512 → 512
+**當前版本特色**:
+- ✅ 簡潔的點缺陷合成策略
+- ✅ 動態 Focal Loss gamma scheduling
+- ✅ 四通道圖片支援（生產環境需求）
+- ✅ 完整的 ONNX 部署方案
+- ✅ 效能優化（patch-based processing + image cache）
 
-2. **Decoder (DecoderSegmentation)**：
-   - 5 次上採樣，每次 scale_factor=2
-   - Skip connections 將 encoder 的特徵圖與 decoder 連接
-   - 最終輸出 2 通道（用於二分類）
+---
 
-### 1.2 loss.py 實作
-直接採用 DRAEM 的 `FocalLoss` 實作，用於處理類別不平衡問題：
+## 核心設計
 
-**參數設定**：
-- `gamma=2`：聚焦參數，減少易分類樣本的權重
-- `alpha=None`：類別平衡參數（使用預設）
-- `smooth=1e-5`：標籤平滑參數
-- `size_average=True`：對 batch 取平均
+### 1. 三通道對比學習機制
 
-## 二、Defect Generation 相關修改
-
-### 2.1 從 point_square_defect.py 到 gaussian.py
-原始實作 point_square_defect.py 被重新設計為更通用的 gaussian.py：
-
-**主要改進**：
-1. **尺寸定義修正**：統一使用 (height, width) 格式，3x5 表示高 3 寬 5
-2. **簡化缺陷類型**：固定使用 3x3 和 3x5 兩種缺陷
-3. **融合方式優化**：採用直接相加法，利用高斯自然漸變
-
-**核心函數**：
-- `create_gaussian_defect()`：生成單個高斯缺陷
-- `create_binary_mask()`：生成二值化遮罩，閾值 0.1
-- `apply_defect_to_background()`：將缺陷應用到背景
-- `generate_multiple_defects()`：生成多個缺陷（未使用）
-- `generate_random_defect_params()`：隨機參數生成（未使用）
-
-### 2.2 dataloader.py 實作
-建立統一的資料載入器，整合三通道生成邏輯：
-
-**Dataset 類別特點**：
-1. **必須提供背景影像路徑**：不再支援合成背景
-2. **動態生成三通道**：
-   - Target：包含所有缺陷
-   - Ref1、Ref2：隨機移除部分缺陷
-3. **Ground Truth 生成**：只標記 target 獨有的缺陷
-
-**參數設定**：
-- 缺陷數量：3-8 個（隨機，在每個 patch 上生成）
-- 缺陷強度：[-80, -60, 60, 80]（混合亮暗，已提升 60% 亮度）
-- 影像大小：可調整，預設 256x256
-- 支援格式：PNG 和 TIFF（float32）
-
-## 三、trainer.py 整合修改
-
-### 3.1 資料載入整合
-```python
-dataset = Dataset(
-    training_path=args.training_dataset_path,  # 必要參數
-    img_size=args.img_size,
-    num_defects_range=args.num_defects_range,
-    img_format=args.img_format,  # 'png' 或 'tiff'
-    use_mask=args.use_mask  # 是否使用 mask 監督
-)
+**設計理念**：
+```
+Target 有 且 Ref1 和 Ref2 都沒有 → 目標缺陷（保留在 GT mask）
+三個通道都有的 → 背景（去除）
+部分通道有的 → 對比學習信號
 ```
 
-### 3.2 命令列參數
-**必要參數**：
-- `--bs`：批次大小
-- `--lr`：學習率
-- `--epochs`：訓練輪數
-- `--checkpoint_path`：檢查點儲存路徑
-- `--training_dataset_path`：訓練資料集路徑
+**通道定義**：
+- **Target (Channel 0)**：包含所有合成缺陷
+- **Ref1 (Channel 1)**：隨機移除部分缺陷
+- **Ref2 (Channel 2)**：隨機移除不同的部分缺陷
+- **Ground Truth Mask**：只標記 Target 獨有的缺陷
 
-**選擇性參數**：
-- `--gpu_id`：GPU ID（預設：0）
-- `--img_size`：影像大小 [height, width]（預設：[256, 256]）
-- `--num_defects_range`：缺陷數量範圍 [min, max]（預設：[5, 15]）
-- `--img_format`：影像格式 'png_jpg' 或 'tiff'（預設：'png_jpg'）
-- `--use_mask`：是否使用 mask 訓練（預設：True）
+### 2. 缺陷合成策略
 
-### 3.3 訓練流程驗證
-經測試確認：
-1. ✅ 缺陷合成正常（生成正確的三通道）
-2. ✅ 網路前向傳播正常（3→2 通道）
-3. ✅ 損失計算和梯度更新正常（Loss 下降）
-4. ✅ 模型儲存正常（包含所需資訊）
+**當前策略**（基於高斯分布的點缺陷）：
 
-## 四、專案當前狀態
+**缺陷類型**：
+- 3×3 點缺陷：sigma = 1.3
+- 3×5 點缺陷：sigma = (1.0, 1.5)
+- 各 50% 機率
 
-### 已完成部分 ✅
+**生成參數**：
+- **缺陷數量**：3-8 個 per patch（可調整）
+- **缺陷強度**：[-80, -60, 60, 80]（亮暗混合）
+- **生成機率**：50%（每個 patch 有 50% 機率含缺陷）
+- **Binary mask 閾值**：0.1
 
-1. **核心功能**：
-   - `gaussian.py`：高斯缺陷生成
-   - `dataloader.py`：資料載入和三通道生成
-   - `model.py`：UNet 分割網路
-   - `loss.py`：Focal Loss
-   - `trainer.py`：訓練主程式
+**智慧分配邏輯**：
+```python
+# 確保有效的對比學習
+Target-only defects: 1-2 個（進入 GT mask）
+Only in Ref1: ~1/3 剩餘缺陷
+Only in Ref2: ~1/3 剩餘缺陷
+Both Refs: ~1/3 剩餘缺陷
+```
 
-2. **專案整理**：
-   - 測試檔案已刪除
-   - 文檔移至 docs/ 資料夾
-   - MVTec 資料集已連結
-   - 建立 grid 和 grid_tiff 兩種格式資料集
+**範例**（5 個缺陷）：
+```
+Target: [A, B, C, D, E]  # 所有缺陷
+Ref1:   [A, C]          # 部分缺陷
+Ref2:   [B, C]          # 不同的部分缺陷
+GT:     [D, E]          # Target 獨有 → 訓練目標
+```
 
-3. **功能驗證**：
-   - 完整訓練流程已測試
-   - 缺陷生成視覺化已確認
-   - 三通道差異機制已驗證
-   - 支援 PNG 和 TIFF 格式訓練
+---
 
-4. **最新更新（2025年1月）**：
-   - 提升缺陷亮度 60%（[-80, -60, 60, 80]）
-   - 新增 80/20 target-only 缺陷控制邏輯
-   - 移除 samples_per_epoch 參數（使用實際圖片數量）
-   - 參數重新命名（background_path → training_dataset_path）
-   - 新增 img_format 和 use_mask 參數
-   - **重要變更**：缺陷數量從原始設計的 5-15 個（整張圖）改為 1-5 個（每個 patch），因應優化後的 patch-based 處理方式
-   - **2025年8月更新**：改進缺陷分配策略，從 1-5 個提升到 3-8 個，並實作智慧分配確保對比學習效果
-   - **2025年8-9月更新**：處理條紋偽陽性問題，詳見 [stripe_false_positive_solutions.md](./stripe_false_positive_solutions.md)
+## 訓練策略
 
-### 專案特色
+### 1. 動態 Focal Loss Gamma Scheduling
 
-1. **對比學習設計**：利用三通道差異訓練模型識別獨特缺陷
-2. **自然缺陷融合**：高斯分布提供自然漸變，無需額外處理
-3. **靈活的資料生成**：動態生成訓練資料，無需預先準備
-4. **簡潔的實作**：相比原始 DRAEM，移除重建網路，專注分割任務
+**核心創新**：使用 cosine schedule 動態調整 focal loss 的 gamma 值
 
-### 使用範例
+**實作細節**：
+```python
+gamma(t) = gamma_start + (gamma_end - gamma_start) * (1 - cos(t/T * π)) / 2
+
+預設配置：
+- gamma_start = 1.0  (訓練初期，類似 cross entropy)
+- gamma_end = 3.0    (訓練後期，強化 hard examples)
+- schedule = 'cosine' (平滑過渡)
+```
+
+**優勢**：
+- 初期：學習基礎特徵，避免過早陷入困難樣本
+- 中期：逐漸增加對困難樣本的關注
+- 後期：精細調整，專注於難分類區域
+
+**Alpha 設定**：
+- `alpha = 0.75`：針對缺陷類別（前景）的權重平衡
+
+### 2. 四通道圖片支援
+
+**背景**：生產環境的圖片包含第 4 通道（mask），訓練和推理需要相容
+
+**處理流程**：
+```python
+# 1. 載入圖片（可能是 3 或 4 通道）
+image = tifffile.imread(path)  # Shape: (C, H, W) or (H, W, C)
+
+# 2. Strip 類型：CHW → HWC 轉換
+if image_type == 'strip' and image.shape[0] in [3, 4]:
+    image = np.transpose(image, (1, 2, 0))
+
+# 3. 只保留前 3 通道
+if image.shape[2] == 4:
+    image = image[:, :, :3]  # Target, Ref1, Ref2
+```
+
+**一致性**：dataloader.py、trainer.py、inference_pytorch.py、inference_onnx.py 全部支援
+
+### 3. 訓練參數配置
+
+**推薦配置**（train.sh）：
+```bash
+--bs 16                          # Batch size
+--lr 0.001                       # Learning rate
+--epochs 30                      # Training epochs
+--num_defects_range 4 10         # Defects per patch
+--image_type strip               # Image type (strip/square/mvtec)
+--img_format tiff                # Image format
+--patch_size 128×128 (strip)     # Auto-selected based on image_type
+            256×256 (square/mvtec)
+--gamma_start 1.0                # Focal loss gamma start
+--gamma_end 3.0                  # Focal loss gamma end
+--cache_size 100                 # Image cache (optional)
+--seed 42                        # Random seed (optional)
+```
+
+**學習率調度**：
+- MultiStepLR: [0.8×epochs, 0.9×epochs]
+- Gamma: 0.2
+
+---
+
+## 模型架構
+
+### 1. UNet Segmentation Network
+
+**輸入/輸出**：
+- Input: (B, 3, H, W) - 三通道堆疊（Target, Ref1, Ref2）
+- Output: (B, 2, H, W) - 二分類 logits（背景/前景）
+
+**架構特點**：
+- Base channels: 64
+- Encoder: 6 個 block，5 次 MaxPool (通道數：3→64→128→256→512→512→512)
+- Decoder: 5 次上採樣 + skip connections
+- 激活函數: ReLU + BatchNorm
+
+### 2. Focal Loss
+
+**公式**：
+```
+FL(pt) = -α * (1 - pt)^γ * log(pt)
+```
+
+**參數**：
+- Alpha (α): 0.75（缺陷類別權重）
+- Gamma (γ): 動態調整（1.0 → 3.0）
+- Smooth: 1e-5（標籤平滑）
+
+---
+
+## 推理與部署
+
+### 1. PyTorch 推理
+
+**特點**：
+- 使用 `calculate_positions()` 動態計算 patch 位置
+- 滑動窗口推理，與訓練一致的 patch 策略
+- 支援可視化輸出（7 個子圖）
+
+**使用範例**：
+```bash
+python inference_pytorch.py \
+    --model_path ./checkpoints/model.pth \
+    --test_path ./test_images/ \
+    --output_dir ./output/pytorch \
+    --img_format tiff \
+    --image_type strip
+```
+
+**可視化內容**：
+1. Target 通道
+2. Ref1 通道
+3. Ref2 通道
+4. Target - Ref1 差異圖
+5. Target - Ref2 差異圖
+6. Double Detection (min(diff1, diff2))
+7. 模型預測 Heatmap
+
+### 2. ONNX 部署方案
+
+#### 架構設計（三層包裝）
+
+**Layer 1: SegmentationNetwork**
+- 基礎 UNet 模型
+- Input: (B, 3, H, W)
+- Output: (B, 2, H, W) - logits
+
+**Layer 2: SegmentationNetworkONNX**
+- 新增 softmax
+- 轉換輸出格式：(B, 2, H, W) → (B, 3, H, W)
+  - Channel 0: 異常 heatmap（前景機率）
+  - Channel 1-2: 零填充（滿足生產需求）
+
+**Layer 3: SegmentationNetworkONNXFullImage**
+- **關鍵特色**：滑動窗口邏輯嵌入在 ONNX 模型內
+- Input: (1, 3, 976, 176) - 完整 strip 圖片
+- Output: (1, 3, 976, 176) - 完整 heatmap
+- **固定配置**：9 個 Y patches × 2 個 X patches
+- **拼接策略**：中心區域拼接（無縫合成）
+
+#### 匯出流程
 
 ```bash
-# PNG/JPG 格式訓練範例
-python trainer.py \
-    --bs 16 \
-    --lr 0.001 \
-    --epochs 100 \
-    --checkpoint_path ./checkpoints \
-    --training_dataset_path ./MVTec_AD_dataset/grid/train/good/ \
-    --img_size 256 256 \
-    --num_defects_range 5 15 \
-    --img_format png_jpg \
-    --use_mask True
-
-# TIFF 格式訓練範例
-python trainer.py \
-    --bs 16 \
-    --lr 0.001 \
-    --epochs 100 \
-    --checkpoint_path ./checkpoints \
-    --training_dataset_path ./MVTec_AD_dataset/grid_tiff/train/good/ \
-    --img_format tiff
+python export_onnx_fullimage.py \
+    --checkpoint_path ./checkpoints/model.pth \
+    --output_path ./onnx_models/model_fullimage.onnx \
+    --opset_version 11
 ```
+
+**匯出內容**：
+- 完整的滑動窗口邏輯
+- Patch 裁切與拼接策略
+- Softmax + 通道轉換
+- 即用型單檔模型
+
+#### ONNX 推理
+
+```bash
+python inference_onnx.py \
+    --model_path ./onnx_models/model_fullimage.onnx \
+    --test_path ./test_images/ \
+    --output_dir ./output/onnx \
+    --img_format tiff \
+    --image_type strip
+```
+
+**優勢**：
+- ✅ 單次呼叫處理完整圖片
+- ✅ 無需外部前處理
+- ✅ 生產環境友善
+- ✅ 與 PyTorch 推理結果一致
+
+---
+
+## 效能優化
+
+### 已實施的優化（2025-08）
+
+1. **動態 Patch 索引計算**
+   - 移除預先計算的 patch list
+   - 減少 98.3% 初始記憶體使用
+
+2. **先裁剪後處理**
+   - 在 patch 上直接生成缺陷
+   - 減少 96% 處理記憶體
+   - 提升 10-20 倍處理速度
+
+3. **局部高斯缺陷生成**
+   - 只在影響區域創建陣列
+   - 避免全圖大小的運算
+
+4. **圖片快取機制**
+   - LRU cache 減少重複載入
+   - 可配置快取大小（`--cache_size`）
+   - 減少 87.5% I/O 操作
+
+**整體成效**：
+- 訓練速度：提升 4-6 倍
+- 記憶體使用：減少 90% 以上
+- I/O 操作：減少 87.5%
+
+---
+
+## 資料集
+
+### 當前使用的資料集
+
+**grid_stripe_4channel** (TIFF float32 格式)：
+```
+grid_stripe_4channel/
+├── train/
+│   └── good/              # 訓練圖片（4 通道，976×176）
+├── test/
+│   ├── good/              # 正常測試圖片
+│   └── bright_spots/      # 異常測試圖片
+└── ground_truth/
+    └── bright_spots/      # Ground truth masks
+```
+
+**圖片格式**：
+- 尺寸：976×176
+- 通道：4 通道 (Target, Ref1, Ref2, Mask)
+- 格式：TIFF float32
+- 訓練時只使用前 3 通道
+
+詳細說明請參考：@dataset_description.md
+
+---
+
+## 使用範例
+
+### 完整訓練到部署流程
+
+```bash
+# 1. 訓練模型
+bash train.sh
+
+# 2. PyTorch 推理（測試）
+python inference_pytorch.py \
+    --model_path ./checkpoints/4channel/BgRemoval_lr0.001_ep30_bs16_128x128_strip.pth \
+    --test_path ./MVTec_AD_dataset/grid_stripe_4channel/test/ \
+    --output_dir ./output/pytorch \
+    --img_format tiff \
+    --image_type strip
+
+# 3. 匯出 ONNX（生產部署）
+python export_onnx_fullimage.py \
+    --checkpoint_path ./checkpoints/4channel/BgRemoval_lr0.001_ep30_bs16_128x128_strip.pth \
+    --output_path ./onnx_models/background_removal_fullimage.onnx
+
+# 4. ONNX 推理（驗證）
+python inference_onnx.py \
+    --model_path ./onnx_models/background_removal_fullimage.onnx \
+    --test_path ./MVTec_AD_dataset/grid_stripe_4channel/test/ \
+    --output_dir ./output/onnx \
+    --img_format tiff \
+    --image_type strip
+```
+
+---
+
+## 重要里程碑
+
+### 2024 年 8 月以前
+- ✅ 建立基礎架構（UNet + Focal Loss）
+- ✅ 實作高斯缺陷生成
+- ✅ 三通道對比學習機制
+- ✅ 資料載入器與訓練流程
+
+### 2024 年 8 月
+- ✅ 效能優化（4-6 倍訓練加速）
+- ✅ 條紋偽陽性問題探索（實驗多種方案）
+- ✅ 推理邊界問題修復
+
+### 2024 年 9 月 - 2025 年 1 月
+- ✅ 回歸基礎點缺陷策略（移除複雜線條實驗）
+- ✅ 動態 Focal Loss gamma scheduling
+- ✅ 四通道圖片支援
+- ✅ ONNX 完整部署方案
+- ✅ 文件整理與歸檔
+
+---
+
+## 專案檔案結構
+
+```
+Background_Removal_Net/
+├── gaussian.py                    # 高斯缺陷生成
+├── dataloader.py                  # 資料載入（支援 3/4 通道）
+├── model.py                       # UNet + ONNX 包裝
+├── loss.py                        # Focal Loss（支援動態 gamma）
+├── trainer.py                     # 訓練主程式
+├── inference_pytorch.py           # PyTorch 推理
+├── inference_onnx.py              # ONNX 推理
+├── export_onnx_fullimage.py       # ONNX 匯出
+├── train.sh                       # 訓練腳本
+├── inference_pytorch.sh           # PyTorch 推理腳本
+├── inference_onnx.sh              # ONNX 推理腳本
+└── docs/develop/
+    ├── project_discussion.md      # 專案概念說明
+    ├── development_record.md      # 本文件
+    ├── dataset_description.md     # 資料集說明
+    └── archive/                   # 歷史文件歸檔
+```
+
+---
+
+## 未來發展方向
+
+### 短期改進
+- [ ] 評估不同 gamma schedule（linear vs cosine vs exponential）
+- [ ] 實驗不同的 alpha 值對缺陷檢測的影響
+- [ ] 建立更完整的測試集與 benchmark
+
+### 長期方向
+- [ ] 探索更輕量的模型架構（MobileNet-based UNet）
+- [ ] 模型量化（INT8）加速推理
+- [ ] 多尺度推理融合
+- [ ] 自適應缺陷生成策略
+
+---
+
+## 參考資料
+
+**相關文件**：
+- @project_discussion.md - 專案核心概念
+- @dataset_description.md - 資料集詳細說明
+- @archive/optimization_history.md - 效能優化歷程
+- @archive/experimental_history.md - 實驗與探索記錄

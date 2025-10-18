@@ -14,7 +14,7 @@ from gaussian import (
 )
 from functools import lru_cache
 import psutil
-
+from scipy.ndimage import gaussian_filter
 
 def calculate_positions(img_size, patch_size, min_patches=2):
     """Calculate patch positions: minimum overlap, maximum coverage
@@ -169,20 +169,14 @@ class Dataset(Dataset):
             raise ValueError(f"Failed to load image: {img_path}")
         
         # Convert from CHW to HWC format for stripe dataset
-        # Support both 3-channel and 4-channel images (4th channel is mask, ignored)
-        if self.image_type == 'strip' and (image.shape[0] == 3 or image.shape[0] == 4):
+        if self.image_type == 'strip' and image.shape[0] == 3:
             image = np.transpose(image, (1, 2, 0))
-
-        # Keep only first 3 channels (target, ref1, ref2)
-        # If 4-channel image, discard the 4th mask channel
-        if image.shape[2] == 4:
-            image = image[:, :, :3]
-
+        
         # Crop patch FIRST (key optimization)
         end_y = start_y + self.patch_size[0]
         end_x = start_x + self.patch_size[1]
         patch = image[start_y:end_y, start_x:end_x]
-
+        
         # Extract three channels from the patch
         target_channel = patch[:, :, 0]
         ref1_channel = patch[:, :, 1]
@@ -210,7 +204,10 @@ class Dataset(Dataset):
                                           full_image_shape=None):
         """
         Generate defects and apply to three channels separately
-        New strategy: 50% chance to have defects in this patch
+        New strategy: 
+        - 20% chance to generate edge negative samples (only if structural edges exist)
+        - 40% chance to have point defects
+        - 40% chance to have no modifications
         
         Args:
             target_channel, ref1_channel, ref2_channel: patch channels (already cropped)
@@ -219,16 +216,24 @@ class Dataset(Dataset):
         """
         h, w = target_channel.shape  # patch dimensions
         
-        # 50% chance to have defects in this patch
-        has_defects = np.random.rand() < 0.5
+        # Decide what type of augmentation to apply
+        rand_val = np.random.rand()
         
-        if not has_defects:
+        if rand_val < 0.2:  # 20% chance: Generate line negative samples
+            # Generate synthetic lines as negative samples
+            return self._generate_edge_negative_samples(target_channel, ref1_channel, ref2_channel)
+        
+        elif rand_val < 0.6:  # 40% chance: Point defects (20% to 60%)
+            # Continue with original point defect generation
+            pass  # Will continue below
+        
+        else:  # 40% chance: No modifications (60% to 100%)
             # No defects - return original channels
             gt_mask = np.zeros_like(target_channel, dtype=np.float32)
             return target_channel.copy(), ref1_channel.copy(), ref2_channel.copy(), gt_mask
         
         # If we have defects, generate defects directly on the patch
-        # Use at least 3 defects to ensure effective contrastive learning
+        # Use num_defects_range from initialization
         num_defects = np.random.randint(self.num_defects_range[0], self.num_defects_range[1] + 1)
         
         # Generate defect parameters in PATCH coordinates
@@ -245,7 +250,8 @@ class Dataset(Dataset):
                 sigma = 1.3  # Increased from 1.0 to make mask larger
             else:
                 size = (3, 5)
-                sigma = (1.0, 1.5)
+                # Increase sigma_x to 2.0 for better edge visibility in 5-pixel width
+                sigma = (2.0, 1.5)  # (sigma_x, sigma_y) - increased x from 1.0 to 2.0
             
             # Random intensity - increased for better visibility
             intensity = np.random.choice([-80, -60, 60, 80])
@@ -341,5 +347,125 @@ class Dataset(Dataset):
                     gt_mask[y_start:y_end, x_start:x_end],
                     local_mask
                 )
+        
+        return target, ref1, ref2, gt_mask
+    
+    def _has_structural_edges(self, image_patch, edge_ratio_threshold=0.02):
+        """
+        Check if a patch has structural edges (grid, stripes) rather than point defects
+        
+        Args:
+            image_patch: Input patch to check
+            edge_ratio_threshold: Minimum ratio of edge pixels to be considered structural
+                                 Default 0.02 (2%) safely excludes point defects
+        
+        Returns:
+            bool: True if structural edges exist, False otherwise
+        """
+        # Convert to uint8 for Canny edge detection
+        patch_uint8 = np.clip(image_patch, 0, 255).astype(np.uint8)
+        
+        # Detect edges using Canny
+        edges = cv2.Canny(patch_uint8, 50, 150)
+        
+        # Calculate edge pixel ratio
+        edge_ratio = np.sum(edges > 0) / edges.size
+        
+        # Based on testing:
+        # - Single defects: ~0.1% edge ratio
+        # - Multiple defects (5-8): ~0.5-0.7% edge ratio  
+        # - Grid/stripe structures: >9% edge ratio
+        # Using 2% threshold provides safe margin
+        
+        return edge_ratio > edge_ratio_threshold
+    
+    def _generate_edge_negative_samples(self, target_channel, ref1_channel, ref2_channel):
+        """
+        Generate line patterns as negative samples.
+        These lines should NOT be detected as defects (GT mask = 0).
+        This helps the model learn to distinguish between continuous lines and point defects.
+        """
+        h, w = target_channel.shape
+        
+        # Create copies for modification
+        target = target_channel.copy()
+        ref1 = ref1_channel.copy()
+        ref2 = ref2_channel.copy()
+        
+        # Generate 1-3 random lines
+        num_lines = np.random.randint(1, 4)
+        
+        for _ in range(num_lines):
+            # Random line width (1 or 2 pixels)
+            line_width = np.random.choice([1, 2])
+            
+            # Randomly choose horizontal or vertical line
+            is_horizontal = np.random.rand() < 0.5
+            
+            if is_horizontal:
+                # Horizontal line
+                y = np.random.randint(0, h - line_width + 1)
+                
+                # Get the line region to check current values
+                line_target = target[y:y+line_width, :]
+                line_ref1 = ref1[y:y+line_width, :]
+                line_ref2 = ref2[y:y+line_width, :]
+            else:
+                # Vertical line
+                x = np.random.randint(0, w - line_width + 1)
+                
+                # Get the line region to check current values
+                line_target = target[:, x:x+line_width]
+                line_ref1 = ref1[:, x:x+line_width]
+                line_ref2 = ref2[:, x:x+line_width]
+            
+            # Check min/max values in the line region for all channels
+            min_val = min(line_target.min(), line_ref1.min(), line_ref2.min())
+            max_val = max(line_target.max(), line_ref1.max(), line_ref2.max())
+            
+            # Calculate safe intensity range to avoid clipping
+            # For positive (brightening): can add up to (255 - max_val)
+            # For negative (darkening): can subtract up to min_val
+            safe_positive = min(255 - max_val, 50)  # Cap at 50
+            safe_negative = max(-min_val, -50)      # Cap at -50
+            
+            # Determine intensity based on safe range
+            # We want at least ±30 for visibility
+            if safe_positive >= 30 and safe_negative <= -30:
+                # Both directions are safe, randomly choose
+                if np.random.rand() < 0.5:
+                    target_intensity = np.random.uniform(30, safe_positive)
+                else:
+                    target_intensity = np.random.uniform(safe_negative, -30)
+            elif safe_positive >= 30:
+                # Only positive is safe
+                target_intensity = np.random.uniform(30, safe_positive)
+            elif safe_negative <= -30:
+                # Only negative is safe
+                target_intensity = np.random.uniform(safe_negative, -30)
+            else:
+                # Not enough room for a visible line, skip this one
+                continue
+            
+            # Ref channels get weaker intensity (60% of target)
+            ref_intensity = target_intensity * 0.6
+            
+            # Apply the intensity change to the line
+            if is_horizontal:
+                target[y:y+line_width, :] += target_intensity
+                ref1[y:y+line_width, :] += ref_intensity
+                ref2[y:y+line_width, :] += ref_intensity
+            else:
+                target[:, x:x+line_width] += target_intensity
+                ref1[:, x:x+line_width] += ref_intensity
+                ref2[:, x:x+line_width] += ref_intensity
+        
+        # Clip values to valid range (should rarely be needed now)
+        target = np.clip(target, 0, 255)
+        ref1 = np.clip(ref1, 0, 255)
+        ref2 = np.clip(ref2, 0, 255)
+        
+        # IMPORTANT: GT mask is all zeros - these are NOT defects!
+        gt_mask = np.zeros_like(target_channel, dtype=np.float32)
         
         return target, ref1, ref2, gt_mask
