@@ -17,7 +17,7 @@ from dataloader import calculate_positions
 class InferenceDataset(Dataset):
     """Dataset for inference - loads test images without augmentation"""
     
-    def __init__(self, test_path, patch_size=(256, 256), img_format='png_jpg', image_type='mvtec'):
+    def __init__(self, test_path, patch_size=(256, 256), img_format='png_jpg', image_type='square'):
         self.patch_size = patch_size
         self.img_format = img_format
         self.image_type = image_type
@@ -76,7 +76,7 @@ class InferenceDataset(Dataset):
         }
 
 
-def sliding_window_inference(image, model, patch_size, device, image_type='mvtec'):
+def sliding_window_inference(image, model, patch_size, device, image_type='square'):
     """Perform sliding window inference using adaptive window positioning"""
     h, w = image.shape[:2]
     patch_h, patch_w = patch_size
@@ -90,9 +90,11 @@ def sliding_window_inference(image, model, patch_size, device, image_type='mvtec
     if image_type == 'strip':
         # For strip images, use 9 patches in Y direction (same as training)
         y_positions = calculate_positions(h, patch_h, min_patches=9)
-    else:
-        y_positions = calculate_positions(h, patch_h)
-    x_positions = calculate_positions(w, patch_w)
+        x_positions = calculate_positions(w, patch_w)
+    else:  # square
+        # For square images, use 3 patches in both directions (same as training)
+        y_positions = calculate_positions(h, patch_h, min_patches=3)
+        x_positions = calculate_positions(w, patch_w, min_patches=3)
     
     if y_positions is None or x_positions is None:
         raise ValueError(f"Image size ({h}x{w}) is too small for patch size ({patch_h}x{patch_w})")
@@ -452,8 +454,8 @@ def main():
                         help='GPU ID to use. Set to -1 for CPU (default: 0)')
     parser.add_argument('--img_format', type=str, choices=['png_jpg', 'tiff'], default='png_jpg',
                         help='Image format (default: png_jpg)')
-    parser.add_argument('--image_type', type=str, choices=['strip', 'square', 'mvtec'], default='mvtec',
-                        help='Image type (used if not in checkpoint): strip, square, mvtec')
+    parser.add_argument('--image_type', type=str, choices=['strip', 'square'], default='square',
+                        help='Image type (used if not in checkpoint): strip, square')
     # Note: inference_stride is removed as we now use adaptive positioning
     parser.add_argument('--use_ground_truth_mask', type=str, choices=['True', 'False'], default='False',
                         help='Whether to calculate AUROC using ground truth masks (default: False)')

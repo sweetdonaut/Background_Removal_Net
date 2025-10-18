@@ -7,4 +7,5 @@ python trainer.py \
     --image_type strip \
     --training_dataset_path ./MVTec_AD_dataset/grid_stripe_4channel/train/good/ \
     --img_format tiff \
-    --num_defects_range 4 10
+    --num_defects_range 4 10 \
+    --cache_size 100

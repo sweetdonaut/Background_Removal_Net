@@ -330,3 +330,117 @@ class SegmentationNetworkONNXFullImage(nn.Module):
         final_output = torch.cat([output_heatmap, zeros, zeros], dim=1)
 
         return final_output
+
+
+class SegmentationNetworkONNXSquare(nn.Module):
+    """
+    ONNX deployment wrapper for square images with sliding window
+
+    This wrapper processes a complete square image (320x320) in a single pass:
+    - Input: (1, 3, 320, 320) - Full square image
+    - Output: (1, 3, 320, 320) - Full heatmap with 3 channels
+
+    The sliding window logic and patch merging are embedded inside the model.
+    """
+    def __init__(self, patch_model):
+        super(SegmentationNetworkONNXSquare, self).__init__()
+        self.patch_model = patch_model  # SegmentationNetworkONNX instance
+
+        # Fixed configuration for square images
+        self.image_h = 320
+        self.image_w = 320
+        self.patch_h = 128
+        self.patch_w = 128
+
+        # Fixed patch positions (same as training)
+        # Y: 3 positions, X: 3 positions
+        self.y_positions = torch.tensor([0, 96, 192], dtype=torch.long)
+        self.x_positions = torch.tensor([0, 96, 192], dtype=torch.long)
+
+        self.num_y = len(self.y_positions)
+        self.num_x = len(self.x_positions)
+
+    def forward(self, x):
+        """
+        Process full image with sliding window
+
+        Args:
+            x: (1, 3, 320, 320) - Full square image
+
+        Returns:
+            (1, 3, 320, 320) - Full heatmap (ch0: anomaly, ch1-2: zeros)
+        """
+        batch_size = x.shape[0]
+
+        # Initialize output heatmap (only channel 0 will have values)
+        output_heatmap = torch.zeros(batch_size, 1, self.image_h, self.image_w,
+                                     dtype=x.dtype, device=x.device)
+
+        # Process each patch
+        for y_idx in range(self.num_y):
+            for x_idx in range(self.num_x):
+                y = self.y_positions[y_idx]
+                x_pos = self.x_positions[x_idx]
+
+                # Extract patch
+                patch = x[:, :, y:y+self.patch_h, x_pos:x_pos+self.patch_w]
+
+                # Inference on patch - returns (1, 3, 128, 128)
+                patch_output = self.patch_model(patch)
+
+                # Extract anomaly channel (channel 0)
+                patch_heatmap = patch_output[:, 0:1, :, :]  # (1, 1, 128, 128)
+
+                # Determine crop region based on position
+                # For 3x3 grid with overlap of 32 pixels, margin is 16 pixels
+                margin = 16
+
+                # Y direction cropping
+                if y_idx == 0:
+                    # First patch: keep top, remove bottom margin
+                    y_start_crop = 0
+                    y_end_crop = self.patch_h - margin
+                elif y_idx == self.num_y - 1:
+                    # Last patch: remove top margin, keep bottom
+                    y_start_crop = margin
+                    y_end_crop = self.patch_h
+                else:
+                    # Middle patches: remove both margins
+                    y_start_crop = margin
+                    y_end_crop = self.patch_h - margin
+
+                # X direction cropping
+                if x_idx == 0:
+                    # First patch: keep left, remove right margin
+                    x_start_crop = 0
+                    x_end_crop = self.patch_w - margin
+                elif x_idx == self.num_x - 1:
+                    # Last patch: remove left margin, keep right
+                    x_start_crop = margin
+                    x_end_crop = self.patch_w
+                else:
+                    # Middle patches: remove both margins
+                    x_start_crop = margin
+                    x_end_crop = self.patch_w - margin
+
+                # Extract region to use
+                patch_region = patch_heatmap[:, :, y_start_crop:y_end_crop,
+                                            x_start_crop:x_end_crop]
+
+                # Calculate output position
+                output_y_start = y + y_start_crop
+                output_y_end = y + y_end_crop
+                output_x_start = x_pos + x_start_crop
+                output_x_end = x_pos + x_end_crop
+
+                # Place region in output (direct assignment)
+                output_heatmap[:, :, output_y_start:output_y_end,
+                              output_x_start:output_x_end] = patch_region
+
+        # Create zero channels
+        zeros = torch.zeros_like(output_heatmap)
+
+        # Concatenate: [anomaly, zero, zero] -> (1, 3, 320, 320)
+        final_output = torch.cat([output_heatmap, zeros, zeros], dim=1)
+
+        return final_output

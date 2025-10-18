@@ -1,0 +1,11 @@
+python trainer.py \
+    --bs 16 \
+    --lr 0.001 \
+    --epochs 30 \
+    --gpu_id 0 \
+    --checkpoint_path ./checkpoints/square_3channel \
+    --image_type square \
+    --training_dataset_path ./MVTec_AD_dataset/grid_align_3channel/train/good/ \
+    --img_format tiff \
+    --num_defects_range 3 8 \
+    --cache_size 100

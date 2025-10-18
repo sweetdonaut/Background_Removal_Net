@@ -61,7 +61,7 @@ class Dataset(Dataset):
             num_defects_range: (min, max) number of defects per patch (default 3-8)
             defect_size_range: Not used anymore, we use fixed 3x3 and 3x5
             img_format: Image format to load ('png_jpg' or 'tiff')
-            image_type: Type of images ('strip', 'square', 'mvtec')
+            image_type: Type of images ('strip', 'square')
             cache_size: Number of images to cache (0 = no cache)
         """
         self.patch_size = patch_size
@@ -91,10 +91,13 @@ class Dataset(Dataset):
             raise ValueError(f"No images found in {training_path}")
         
         print(f"Found {len(self.training_paths)} training images")
-        
+
         # Setup image cache if requested
         self._setup_cache()
-        
+
+        # Detect image size and display info (for square type, auto-detect size)
+        self._detect_and_display_image_info()
+
         # Calculate patch positions once (not all combinations)
         self._setup_patch_positions()
     
@@ -105,13 +108,69 @@ class Dataset(Dataset):
             self._load_image = lru_cache(maxsize=self.cache_size)(self._load_image_uncached)
         else:
             self._load_image = self._load_image_uncached
-    
+
     def _load_image_uncached(self, img_path):
         """Load image without caching"""
         if self.img_format == 'tiff':
             return tifffile.imread(img_path)
         else:
             return cv2.imread(img_path)
+
+    def _detect_and_display_image_info(self):
+        """
+        Detect image size from first image and display data type info
+        For square type, auto-detect size; for strip/mvtec, use fixed sizes
+        """
+        print("\n" + "="*60)
+        print("Dataset Image Information")
+        print("="*60)
+
+        # Load first image to get info
+        first_img_path = self.training_paths[0]
+        sample_image = self._load_image(first_img_path)
+
+        if sample_image is None:
+            raise ValueError(f"Failed to load first image: {first_img_path}")
+
+        # Display raw image info (before any processing)
+        print(f"Sample image: {os.path.basename(first_img_path)}")
+        print(f"Raw shape: {sample_image.shape}")
+        print(f"Data type: {sample_image.dtype}")
+        print(f"Value range: [{sample_image.min():.2f}, {sample_image.max():.2f}]")
+
+        # Process image same as in __getitem__ to get actual size
+        image = sample_image
+
+        # Convert from CHW to HWC format for stripe dataset
+        if self.image_type == 'strip' and (image.shape[0] == 3 or image.shape[0] == 4):
+            image = np.transpose(image, (1, 2, 0))
+            print(f"After CHW->HWC conversion: {image.shape}")
+
+        # Keep only first 3 channels
+        if len(image.shape) == 3 and image.shape[2] == 4:
+            image = image[:, :, :3]
+            print(f"After removing 4th channel: {image.shape}")
+
+        # Get final dimensions
+        if len(image.shape) == 3:
+            img_h, img_w, num_channels = image.shape
+            print(f"Final processed shape: {img_h} x {img_w} x {num_channels} channels")
+        else:
+            img_h, img_w = image.shape
+            num_channels = 1
+            print(f"Final processed shape: {img_h} x {img_w} (grayscale)")
+
+        # For square type, store detected size for later use
+        if self.image_type == 'square':
+            self.detected_img_h = img_h
+            self.detected_img_w = img_w
+            print(f"\n✓ Auto-detected square image size: {img_h} x {img_w}")
+
+            # Verify it's actually square
+            if img_h != img_w:
+                print(f"⚠ Warning: image_type is 'square' but detected size is not square ({img_h} x {img_w})")
+
+        print("="*60 + "\n")
     
     def _setup_patch_positions(self):
         """Setup patch positions for dynamic calculation"""
@@ -119,19 +178,27 @@ class Dataset(Dataset):
         if self.image_type == 'strip':
             img_h, img_w = 976, 176
         elif self.image_type == 'square':
-            img_h, img_w = 600, 600
-        else:  # mvtec
-            img_h, img_w = 1024, 1024
-        
+            # Use auto-detected size for square images
+            if hasattr(self, 'detected_img_h') and hasattr(self, 'detected_img_w'):
+                img_h, img_w = self.detected_img_h, self.detected_img_w
+            else:
+                # Fallback to default if detection failed
+                img_h, img_w = 600, 600
+                print(f"⚠ Warning: Could not detect square image size, using default 600x600")
+        else:
+            raise ValueError(f"Unknown image_type: {self.image_type}. Must be 'strip' or 'square'")
+
         print(f"Using image size {img_h}x{img_w} for image_type: {self.image_type}")
         
         # Calculate positions for height and width
         if self.image_type == 'strip':
             # For strip images, use 9 patches in Y direction
             self.y_positions = calculate_positions(img_h, self.patch_size[0], min_patches=9)
-        else:
-            self.y_positions = calculate_positions(img_h, self.patch_size[0])
-        self.x_positions = calculate_positions(img_w, self.patch_size[1])
+            self.x_positions = calculate_positions(img_w, self.patch_size[1])
+        else:  # square
+            # For square images, use 3 patches in both directions
+            self.y_positions = calculate_positions(img_h, self.patch_size[0], min_patches=3)
+            self.x_positions = calculate_positions(img_w, self.patch_size[1], min_patches=3)
         
         if self.y_positions is None or self.x_positions is None:
             raise ValueError(f"Image size {img_h}x{img_w} is smaller than patch size {self.patch_size}")
@@ -182,6 +249,10 @@ class Dataset(Dataset):
         end_y = start_y + self.patch_size[0]
         end_x = start_x + self.patch_size[1]
         patch = image[start_y:end_y, start_x:end_x]
+
+        # Convert to float32 for defect generation (handles both uint8 and float32 inputs)
+        if patch.dtype == np.uint8:
+            patch = patch.astype(np.float32)
 
         # Extract three channels from the patch
         target_channel = patch[:, :, 0]

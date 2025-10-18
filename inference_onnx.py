@@ -10,7 +10,7 @@ import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 
 
-def load_test_images(test_path, img_format='png_jpg', image_type='mvtec'):
+def load_test_images(test_path, img_format='png_jpg', image_type='square'):
     """Load test images from directory"""
     image_paths = []
 
@@ -45,7 +45,7 @@ def fullimage_inference(image, ort_session, image_type='strip'):
     Args:
         image: Input image (H, W, 3) in uint8 or float32
         ort_session: ONNX Runtime inference session
-        image_type: Type of images ('strip', 'square', 'mvtec')
+        image_type: Type of images ('strip', 'square')
 
     Returns:
         output_heatmap: Anomaly heatmap (H, W) in range [0, 1]
@@ -324,8 +324,8 @@ def main():
     # Optional arguments
     parser.add_argument('--img_format', type=str, choices=['png_jpg', 'tiff'], default='png_jpg',
                         help='Image format (default: png_jpg)')
-    parser.add_argument('--image_type', type=str, choices=['strip', 'square', 'mvtec'], default='mvtec',
-                        help='Image type: strip, square, mvtec (default: mvtec)')
+    parser.add_argument('--image_type', type=str, choices=['strip', 'square'], default='square',
+                        help='Image type: strip, square (default: square)')
     parser.add_argument('--use_ground_truth_mask', action='store_true',
                         help='Calculate AUROC using ground truth masks')
 

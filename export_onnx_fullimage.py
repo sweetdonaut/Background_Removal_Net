@@ -2,7 +2,7 @@ import torch
 import argparse
 import os
 import numpy as np
-from model import SegmentationNetwork, SegmentationNetworkONNX, SegmentationNetworkONNXFullImage
+from model import SegmentationNetwork, SegmentationNetworkONNX, SegmentationNetworkONNXFullImage, SegmentationNetworkONNXSquare
 
 
 def export_fullimage_to_onnx(checkpoint_path, output_path, opset_version=11):
@@ -35,10 +35,17 @@ def export_fullimage_to_onnx(checkpoint_path, output_path, opset_version=11):
     print(f"   - Image type: {image_type}")
     print(f"   - Epoch: {checkpoint.get('epoch', 'N/A')}")
 
-    if image_type != 'strip':
-        print(f"\n⚠️  Warning: This export script is designed for 'strip' images.")
-        print(f"   Current image type: {image_type}")
-        print(f"   Proceeding anyway, but output may not be correct.")
+    # Determine image dimensions and wrapper based on image_type
+    if image_type == 'strip':
+        image_h, image_w = 976, 176
+        num_y_patches, num_x_patches = 9, 2
+        wrapper_class = SegmentationNetworkONNXFullImage
+    elif image_type == 'square':
+        image_h, image_w = 320, 320
+        num_y_patches, num_x_patches = 3, 3
+        wrapper_class = SegmentationNetworkONNXSquare
+    else:
+        raise ValueError(f"Unsupported image_type: {image_type}. Must be 'strip' or 'square'.")
 
     # Create base model
     print("\n2. Creating base segmentation network...")
@@ -52,13 +59,13 @@ def export_fullimage_to_onnx(checkpoint_path, output_path, opset_version=11):
     patch_onnx_model.eval()
 
     # Wrap with full-image ONNX wrapper (adds sliding window)
-    print("4. Creating full-image ONNX wrapper (with sliding window)...")
-    full_image_model = SegmentationNetworkONNXFullImage(patch_onnx_model)
+    print(f"4. Creating full-image ONNX wrapper (with sliding window) for {image_type}...")
+    full_image_model = wrapper_class(patch_onnx_model)
     full_image_model.eval()
 
     # Create dummy input for FULL IMAGE
-    print(f"\n5. Creating dummy input: (1, 3, 976, 176)")
-    dummy_input = torch.randn(1, 3, 976, 176)
+    print(f"\n5. Creating dummy input: (1, 3, {image_h}, {image_w})")
+    dummy_input = torch.randn(1, 3, image_h, image_w)
 
     # Test forward pass
     print("6. Testing forward pass...")
@@ -155,11 +162,12 @@ def export_fullimage_to_onnx(checkpoint_path, output_path, opset_version=11):
     print(f"✓ Checkpoint: {checkpoint_path}")
     print(f"✓ ONNX Model: {output_path}")
     print(f"✓ File Size: {file_size_mb:.2f} MB")
+    print(f"✓ Image Type: {image_type}")
     print(f"")
-    print(f"✓ Input Shape: (1, 3, 976, 176) - FULL IMAGE")
-    print(f"✓ Output Shape: (1, 3, 976, 176) - FULL HEATMAP")
+    print(f"✓ Input Shape: (1, 3, {image_h}, {image_w}) - FULL IMAGE")
+    print(f"✓ Output Shape: (1, 3, {image_h}, {image_w}) - FULL HEATMAP")
     print(f"")
-    print(f"✓ Sliding Window: EMBEDDED IN ONNX (9 Y × 2 X patches)")
+    print(f"✓ Sliding Window: EMBEDDED IN ONNX ({num_y_patches} Y × {num_x_patches} X patches)")
     print(f"✓ Output Channel 0: Anomaly heatmap (probability)")
     print(f"✓ Output Channel 1-2: Zero-filled placeholders")
     print("=" * 80)

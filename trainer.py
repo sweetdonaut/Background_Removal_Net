@@ -225,8 +225,8 @@ def train_on_device(args):
     # Determine patch size based on image type
     if args.image_type == 'strip':
         patch_size = (128, 128)
-    else:  # square or mvtec
-        patch_size = (256, 256)
+    else:  # square
+        patch_size = (128, 128)
     
     run_name = f'BgRemoval_lr{args.lr}_ep{args.epochs}_bs{args.bs}_{patch_size[0]}x{patch_size[1]}_{args.image_type}'
     
@@ -338,8 +338,8 @@ def main():
     parser.add_argument('--gpu_id', action='store', type=int, default=0, 
                         help='GPU ID to use. Set to -1 to use CPU')
     parser.add_argument('--checkpoint_path', action='store', type=str, required=True, help='Path to save checkpoints')
-    parser.add_argument('--image_type', action='store', type=str, choices=['strip', 'square', 'mvtec'], 
-                        default='mvtec', help='Image type: strip (128x128), square/mvtec (256x256)')
+    parser.add_argument('--image_type', action='store', type=str, choices=['strip', 'square'],
+                        default='square', help='Image type: strip (128x128), square (256x256)')
     parser.add_argument('--num_defects_range', action='store', type=int, nargs=2, default=[3, 8],
                         help='Range of number of defects to generate [min, max]')
     parser.add_argument('--training_dataset_path', action='store', type=str, required=True,
