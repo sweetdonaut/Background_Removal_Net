@@ -219,6 +219,17 @@ def inference(args):
         if len(image.shape) == 3 and image.shape[2] == 4:
             image = image[:, :, :3]
 
+        # Normalize to 0-255 range if needed (handles raw sensor values)
+        image = image.astype(np.float32)
+        img_min = image.min()
+        img_max = image.max()
+        if img_min < 0 or img_max > 255:
+            # Not in 0-255 range, normalize it
+            if img_max > img_min:
+                image = (image - img_min) / (img_max - img_min) * 255.0
+            else:
+                image = np.zeros_like(image)
+
         # Verify image size
         h, w = image.shape[:2]
         if h != expected_h or w != expected_w:

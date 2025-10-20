@@ -336,9 +336,9 @@ class SegmentationNetworkONNXSquare(nn.Module):
     """
     ONNX deployment wrapper for square images with sliding window
 
-    This wrapper processes a complete square image (320x320) in a single pass:
-    - Input: (1, 3, 320, 320) - Full square image
-    - Output: (1, 3, 320, 320) - Full heatmap with 3 channels
+    This wrapper processes a complete square image (384x384) in a single pass:
+    - Input: (1, 3, 384, 384) - Full square image
+    - Output: (1, 3, 384, 384) - Full heatmap with 3 channels
 
     The sliding window logic and patch merging are embedded inside the model.
     """
@@ -346,16 +346,16 @@ class SegmentationNetworkONNXSquare(nn.Module):
         super(SegmentationNetworkONNXSquare, self).__init__()
         self.patch_model = patch_model  # SegmentationNetworkONNX instance
 
-        # Fixed configuration for square images
-        self.image_h = 320
-        self.image_w = 320
+        # Fixed configuration for square images (384x384)
+        self.image_h = 384
+        self.image_w = 384
         self.patch_h = 128
         self.patch_w = 128
 
         # Fixed patch positions (same as training)
-        # Y: 3 positions, X: 3 positions
-        self.y_positions = torch.tensor([0, 96, 192], dtype=torch.long)
-        self.x_positions = torch.tensor([0, 96, 192], dtype=torch.long)
+        # Y: 4 positions, X: 4 positions (overlap ~43 pixels)
+        self.y_positions = torch.tensor([0, 85, 170, 256], dtype=torch.long)
+        self.x_positions = torch.tensor([0, 85, 170, 256], dtype=torch.long)
 
         self.num_y = len(self.y_positions)
         self.num_x = len(self.x_positions)
@@ -365,10 +365,10 @@ class SegmentationNetworkONNXSquare(nn.Module):
         Process full image with sliding window
 
         Args:
-            x: (1, 3, 320, 320) - Full square image
+            x: (1, 3, 384, 384) - Full square image
 
         Returns:
-            (1, 3, 320, 320) - Full heatmap (ch0: anomaly, ch1-2: zeros)
+            (1, 3, 384, 384) - Full heatmap (ch0: anomaly, ch1-2: zeros)
         """
         batch_size = x.shape[0]
 
@@ -392,8 +392,8 @@ class SegmentationNetworkONNXSquare(nn.Module):
                 patch_heatmap = patch_output[:, 0:1, :, :]  # (1, 1, 128, 128)
 
                 # Determine crop region based on position
-                # For 3x3 grid with overlap of 32 pixels, margin is 16 pixels
-                margin = 16
+                # For 4x4 grid with overlap of 43 pixels, margin is 21 pixels
+                margin = 21
 
                 # Y direction cropping
                 if y_idx == 0:

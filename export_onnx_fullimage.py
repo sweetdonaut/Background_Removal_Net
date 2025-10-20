@@ -41,8 +41,8 @@ def export_fullimage_to_onnx(checkpoint_path, output_path, opset_version=11):
         num_y_patches, num_x_patches = 9, 2
         wrapper_class = SegmentationNetworkONNXFullImage
     elif image_type == 'square':
-        image_h, image_w = 320, 320
-        num_y_patches, num_x_patches = 3, 3
+        image_h, image_w = 384, 384
+        num_y_patches, num_x_patches = 4, 4
         wrapper_class = SegmentationNetworkONNXSquare
     else:
         raise ValueError(f"Unsupported image_type: {image_type}. Must be 'strip' or 'square'.")

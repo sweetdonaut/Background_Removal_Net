@@ -66,6 +66,17 @@ class InferenceDataset(Dataset):
         if len(image.shape) == 3 and image.shape[2] == 4:
             image = image[:, :, :3]
 
+        # Normalize to 0-255 range if needed (handles raw sensor values)
+        image = image.astype(np.float32)
+        img_min = image.min()
+        img_max = image.max()
+        if img_min < 0 or img_max > 255:
+            # Not in 0-255 range, normalize it
+            if img_max > img_min:
+                image = (image - img_min) / (img_max - img_min) * 255.0
+            else:
+                image = np.zeros_like(image)
+
         # Store original image and info
         original_h, original_w = image.shape[:2]
         
@@ -92,9 +103,9 @@ def sliding_window_inference(image, model, patch_size, device, image_type='squar
         y_positions = calculate_positions(h, patch_h, min_patches=9)
         x_positions = calculate_positions(w, patch_w)
     else:  # square
-        # For square images, use 3 patches in both directions (same as training)
-        y_positions = calculate_positions(h, patch_h, min_patches=3)
-        x_positions = calculate_positions(w, patch_w, min_patches=3)
+        # For square images, use 4 patches in both directions (ensures overlap for 384x384)
+        y_positions = calculate_positions(h, patch_h, min_patches=4)
+        x_positions = calculate_positions(w, patch_w, min_patches=4)
     
     if y_positions is None or x_positions is None:
         raise ValueError(f"Image size ({h}x{w}) is too small for patch size ({patch_h}x{patch_w})")
@@ -126,25 +137,37 @@ def sliding_window_inference(image, model, patch_size, device, image_type='squar
                 patch_heatmap = output_sm[:, 1, :, :].squeeze().cpu().numpy()
             
             # Determine which region to use based on patch position
-            if image_type == 'strip' and len(y_positions) > 2:
-                # For strip images with multiple patches, use center-only strategy
+            if (image_type == 'strip' or image_type == 'square') and len(y_positions) > 2:
+                # For strip/square images with multiple patches, use center-only strategy
+                # Calculate margins based on image type
+                if image_type == 'strip':
+                    y_margin = 11  # Strip uses fixed margin
+                else:  # square
+                    # Calculate margin dynamically based on overlap
+                    y_stride = y_positions[1] - y_positions[0] if len(y_positions) > 1 else patch_h
+                    y_margin = (patch_h - y_stride) // 2
+
                 if y_idx == 0:
                     # First patch: keep top edge, remove bottom overlap
                     y_start_crop = 0
-                    y_end_crop = patch_h - 11  # Remove bottom 11 pixels
+                    y_end_crop = patch_h - y_margin
                 elif y_idx == len(y_positions) - 1:
                     # Last patch: remove top overlap, keep bottom edge
-                    y_start_crop = 11  # Remove top 11 pixels
+                    y_start_crop = y_margin
                     y_end_crop = patch_h
                 else:
                     # Middle patches: use only center region
-                    y_start_crop = 11  # Remove top 11 pixels
-                    y_end_crop = patch_h - 11  # Remove bottom 11 pixels
-                
+                    y_start_crop = y_margin
+                    y_end_crop = patch_h - y_margin
+
                 # X direction: handle overlap if there are multiple patches
                 if len(x_positions) > 1:
-                    x_stride = x_positions[1] - x_positions[0]  # Should be 48
-                    x_margin = (patch_w - x_stride) // 2  # Should be 40
+                    if image_type == 'strip':
+                        x_stride = x_positions[1] - x_positions[0]  # Should be 48
+                        x_margin = (patch_w - x_stride) // 2  # Should be 40
+                    else:  # square
+                        x_stride = x_positions[1] - x_positions[0]
+                        x_margin = (patch_w - x_stride) // 2
                     
                     if x_idx == 0:
                         # First patch in X: keep left edge, remove right overlap

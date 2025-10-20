@@ -196,9 +196,9 @@ class Dataset(Dataset):
             self.y_positions = calculate_positions(img_h, self.patch_size[0], min_patches=9)
             self.x_positions = calculate_positions(img_w, self.patch_size[1])
         else:  # square
-            # For square images, use 3 patches in both directions
-            self.y_positions = calculate_positions(img_h, self.patch_size[0], min_patches=3)
-            self.x_positions = calculate_positions(img_w, self.patch_size[1], min_patches=3)
+            # For square images, use 4 patches in both directions (ensures overlap for 384x384)
+            self.y_positions = calculate_positions(img_h, self.patch_size[0], min_patches=4)
+            self.x_positions = calculate_positions(img_w, self.patch_size[1], min_patches=4)
         
         if self.y_positions is None or self.x_positions is None:
             raise ValueError(f"Image size {img_h}x{img_w} is smaller than patch size {self.patch_size}")
@@ -244,6 +244,17 @@ class Dataset(Dataset):
         # If 4-channel image, discard the 4th mask channel
         if image.shape[2] == 4:
             image = image[:, :, :3]
+
+        # Normalize to 0-255 range if needed (handles raw sensor values)
+        image = image.astype(np.float32)
+        img_min = image.min()
+        img_max = image.max()
+        if img_min < 0 or img_max > 255:
+            # Not in 0-255 range, normalize it
+            if img_max > img_min:
+                image = (image - img_min) / (img_max - img_min) * 255.0
+            else:
+                image = np.zeros_like(image)
 
         # Crop patch FIRST (key optimization)
         end_y = start_y + self.patch_size[0]
