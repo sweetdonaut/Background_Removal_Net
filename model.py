@@ -247,11 +247,14 @@ class SegmentationNetworkONNXFullImage(nn.Module):
         Process full image with sliding window
 
         Args:
-            x: (1, 3, 976, 176) - Full strip image
+            x: (1, 3, 976, 176) - Full strip image (0-255 range)
 
         Returns:
             (1, 3, 976, 176) - Full heatmap (ch0: anomaly, ch1-2: zeros)
         """
+        # Input normalization: convert from 0-255 to 0-1 range
+        x = x / 255.0
+
         batch_size = x.shape[0]
 
         # Initialize output heatmap (only channel 0 will have values)
