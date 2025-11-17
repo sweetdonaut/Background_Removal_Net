@@ -2,6 +2,7 @@ import torch
 import onnxruntime as ort
 import numpy as np
 import tifffile
+import time
 
 ort.set_default_logger_severity(3)
 
@@ -61,13 +62,26 @@ if __name__ == '__main__':
 
     inference_inputs = [cur, ref0, ref1]
     tensor = to_tensor(np.stack(inference_inputs, axis=0), device)
-    inf_scores = model(tensor).detach().to('cpu')
+
+    # Warm up
+    for _ in range(10):
+        _ = model(tensor)
+
+    # Benchmark inference time
+    num_iterations = 100
+    times = []
+    for _ in range(num_iterations):
+        start = time.perf_counter()
+        inf_scores = model(tensor).detach().to('cpu')
+        times.append((time.perf_counter() - start) * 1000)
 
     score = np.squeeze(inf_scores[:, 0:1, :, :].numpy())
 
     print(f"Input shape: {tensor.shape}")
     print(f"Output score shape: {score.shape}")
     print(f"Score range: [{score.min():.6f}, {score.max():.6f}]")
+    print(f"Inference time: {np.mean(times):.2f} ± {np.std(times):.2f} ms")
+    print(f"Throughput: {1000/np.mean(times):.1f} images/sec")
     print(f"Test passed!")
 
     # Visualization (for internal testing only)
