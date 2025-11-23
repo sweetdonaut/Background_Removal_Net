@@ -117,29 +117,58 @@ def visualize_all_features(input_patch, features, output_heatmap, output_path, r
             feat_reduced = reduce_channels(feat, method=reduction_method)
             decoder_features.append((name, feat_reduced, feat.shape))
 
+    # Compute diff images
+    diff1 = target.astype(np.float32) - ref1.astype(np.float32)
+    diff2 = target.astype(np.float32) - ref2.astype(np.float32)
+
+    # Double Detection: select the diff value with smaller absolute value
+    abs_diff1 = np.abs(diff1)
+    abs_diff2 = np.abs(diff2)
+    mask = abs_diff1 < abs_diff2
+    double_det = np.where(mask, diff1, diff2)
+
     # Create figure with 3 rows
-    # Row 1: Input (3 channels)
+    # Row 1: Input (3 channels) + Diff images (3)
     # Row 2: Encoder (6 blocks)
     # Row 3: Decoder (5 blocks) + Output (1)
 
     fig = plt.figure(figsize=(18, 10), dpi=150)
     gs = gridspec.GridSpec(3, 6, figure=fig, hspace=0.4, wspace=0.5)
 
-    # Row 1: Input channels (3 subplots, centered)
-    ax = fig.add_subplot(gs[0, 1])
+    # Row 1: Input channels (3) + Diff images (3)
+    ax = fig.add_subplot(gs[0, 0])
     ax.imshow(target, cmap='gray')
     ax.set_title('Input: Target', fontsize=11, fontweight='bold')
     ax.axis('off')
 
-    ax = fig.add_subplot(gs[0, 2])
+    ax = fig.add_subplot(gs[0, 1])
     ax.imshow(ref1, cmap='gray')
     ax.set_title('Input: Ref1', fontsize=11, fontweight='bold')
     ax.axis('off')
 
-    ax = fig.add_subplot(gs[0, 3])
+    ax = fig.add_subplot(gs[0, 2])
     ax.imshow(ref2, cmap='gray')
     ax.set_title('Input: Ref2', fontsize=11, fontweight='bold')
     ax.axis('off')
+
+    # Diff images (use actual min/max values for colorbar range)
+    ax = fig.add_subplot(gs[0, 3])
+    im = ax.imshow(diff1, cmap='hot', vmin=diff1.min(), vmax=diff1.max())
+    ax.set_title('T - Ref1', fontsize=11, fontweight='bold')
+    ax.axis('off')
+    plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+    ax = fig.add_subplot(gs[0, 4])
+    im = ax.imshow(diff2, cmap='hot', vmin=diff2.min(), vmax=diff2.max())
+    ax.set_title('T - Ref2', fontsize=11, fontweight='bold')
+    ax.axis('off')
+    plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+    ax = fig.add_subplot(gs[0, 5])
+    im = ax.imshow(double_det, cmap='hot', vmin=double_det.min(), vmax=double_det.max())
+    ax.set_title('DoubleDet', fontsize=11, fontweight='bold')
+    ax.axis('off')
+    plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
 
     # Row 2: Encoder features (6 blocks)
     for idx, (name, feat, shape) in enumerate(encoder_features):
