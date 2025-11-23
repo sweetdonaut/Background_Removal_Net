@@ -124,7 +124,7 @@ def part2_crop(input_path, output_path, crop_size=320):
 
 def main():
     # Configuration
-    CROP_SIZE = 320
+    CROP_SIZE = 384
 
     # Paths
     input_base = Path("/home/yclai/vscode_project/Background_Removal_Net/MVTec_AD_dataset/grid_offset_3channel")
