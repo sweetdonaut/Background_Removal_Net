@@ -6,12 +6,11 @@ import os
 from glob import glob
 import tifffile
 from gaussian import (
-    create_gaussian_defect,
     create_binary_mask,
-    apply_defect_to_background,
     create_local_gaussian_defect,
     apply_local_defect_to_background
 )
+from generate_psf import load_config as load_psf_config, create_psf_defect
 from functools import lru_cache
 import psutil
 
@@ -67,19 +66,21 @@ class Dataset(Dataset):
     
     def __init__(self, training_path, patch_size=(128, 128),
                  num_defects_range=(3, 8),
-                 img_format='tiff', cache_size=0):
-        """
-        Args:
-            training_path: Path to training images (required)
-            patch_size: Size of patches to extract (height, width)
-            num_defects_range: (min, max) number of defects per patch (default 3-8)
-            img_format: Image format to load ('png_jpg' or 'tiff')
-            cache_size: Number of images to cache (0 = no cache)
-        """
+                 img_format='tiff', cache_size=0,
+                 defect_mode='gaussian', psf_config_paths=None):
         self.patch_size = patch_size
         self.num_defects_range = num_defects_range
         self.img_format = img_format
         self.cache_size = cache_size
+        self.defect_mode = defect_mode
+
+        if defect_mode == 'psf':
+            if not psf_config_paths:
+                raise ValueError("psf_config_paths required for psf defect mode")
+            self.psf_cfgs = [load_psf_config(p) for p in psf_config_paths]
+            print(f"Defect mode: PSF ({len(self.psf_cfgs)} types: {psf_config_paths})")
+        else:
+            print(f"Defect mode: Gaussian")
         
         # Warning for small defect numbers
         if num_defects_range[0] < 3:
@@ -241,141 +242,106 @@ class Dataset(Dataset):
             "target_mask": gt_mask_tensor
         }
     
-    def generate_defect_images_on_channels(self, target_channel, ref1_channel, ref2_channel,
-                                          patch_offset_y=0, patch_offset_x=0, 
-                                          full_image_shape=None):
+    def _create_one_defect(self, h, w):
+        """Create one defect regardless of mode.
+        Returns (local_defect_0to1, bounds, intensity) or (None, None, None).
         """
-        Generate defects and apply to three channels separately
-        New strategy: 50% chance to have defects in this patch
-        
-        Args:
-            target_channel, ref1_channel, ref2_channel: patch channels (already cropped)
-            patch_offset_y, patch_offset_x: patch position in the full image (not used in new strategy)
-            full_image_shape: (h, w) of the full image (not used in new strategy)
-        """
-        h, w = target_channel.shape  # patch dimensions
-        
-        # 50% chance to have defects in this patch
-        has_defects = np.random.rand() < 0.5
-        
-        if not has_defects:
-            # No defects - return original channels
-            gt_mask = np.zeros_like(target_channel, dtype=np.float32)
-            return target_channel.copy(), ref1_channel.copy(), ref2_channel.copy(), gt_mask
-        
-        # If we have defects, generate defects directly on the patch
-        # Use at least 3 defects to ensure effective contrastive learning
-        num_defects = np.random.randint(self.num_defects_range[0], self.num_defects_range[1] + 1)
-        
-        # Generate defect parameters in PATCH coordinates
-        defect_params = []
-        for i in range(num_defects):
-            # Random position in patch
+        intensity = np.random.choice([-80, -60, 60, 80])
+
+        if self.defect_mode == 'gaussian':
             margin = 5
             cx = np.random.randint(margin, w - margin)
             cy = np.random.randint(margin, h - margin)
-            
-            # Random size (3x3 or 3x5)
             if np.random.rand() > 0.5:
-                size = (3, 3)
-                sigma = 1.3  # Increased from 1.0 to make mask larger
+                size, sigma = (3, 3), 1.3
             else:
-                size = (3, 5)
-                sigma = (1.0, 1.5)
-            
-            # Random intensity - increased for better visibility
-            intensity = np.random.choice([-80, -60, 60, 80])
-            
-            defect_params.append({
-                'center': (cx, cy),
-                'size': size,
-                'sigma': sigma,
-                'intensity': intensity,
-                'id': i
-            })
-        
-        # Create copies for modification
+                size, sigma = (3, 5), (1.0, 1.5)
+            local_defect, bounds = create_local_gaussian_defect(
+                center=(cx, cy), size=size, sigma=sigma,
+                patch_shape=(h, w), patch_offset=(0, 0)
+            )
+            return local_defect, bounds, intensity
+
+        elif self.defect_mode == 'psf':
+            cfg = self.psf_cfgs[np.random.randint(len(self.psf_cfgs))]
+            cropped = create_psf_defect(cfg)
+            if cropped is None:
+                return None, None, None
+            dh, dw = cropped.shape
+            margin = 2
+            max_y = h - dh - margin
+            max_x = w - dw - margin
+            if max_y < margin or max_x < margin:
+                return None, None, None
+            y = np.random.randint(margin, max_y + 1)
+            x = np.random.randint(margin, max_x + 1)
+            bounds = (y, y + dh, x, x + dw)
+            return cropped, bounds, intensity
+
+        return None, None, None
+
+    def generate_defect_images_on_channels(self, target_channel, ref1_channel, ref2_channel):
+        h, w = target_channel.shape
+
+        if np.random.rand() >= 0.5:
+            gt_mask = np.zeros((h, w), dtype=np.float32)
+            return target_channel.copy(), ref1_channel.copy(), ref2_channel.copy(), gt_mask
+
+        num_defects = np.random.randint(self.num_defects_range[0], self.num_defects_range[1] + 1)
+
+        defects = []
+        for _ in range(num_defects):
+            local_defect, bounds, intensity = self._create_one_defect(h, w)
+            if local_defect is not None:
+                defects.append((local_defect, bounds, intensity))
+
+        if not defects:
+            gt_mask = np.zeros((h, w), dtype=np.float32)
+            return target_channel.copy(), ref1_channel.copy(), ref2_channel.copy(), gt_mask
+
+        num_defects = len(defects)
         target = target_channel.copy()
         ref1 = ref1_channel.copy()
         ref2 = ref2_channel.copy()
-        
-        # New smart allocation strategy for contrastive learning
-        
-        # Step 1: Ensure at least 1-2 target-only defects
+
+        # Allocation: ensure target-only defects for contrastive learning
         num_target_only = np.random.randint(1, min(3, num_defects // 2 + 1))
         target_only_ids = set(np.random.choice(num_defects, num_target_only, replace=False))
-        
-        # Step 2: Allocate remaining defects to maximize contrastive signal
+
         remaining_ids = list(set(range(num_defects)) - target_only_ids)
         np.random.shuffle(remaining_ids)
-        
-        # Initialize sets
+
         only_ref1_ids = set()
         only_ref2_ids = set()
-        both_refs_ids = set()
-        
-        # Distribute remaining defects to ensure ref1 != ref2
+
         if len(remaining_ids) >= 2:
-            # Split into three groups for diversity
             n_remaining = len(remaining_ids)
             n_only_ref1 = n_remaining // 3
             n_only_ref2 = n_remaining // 3
-            # Rest goes to both_refs
-            
             only_ref1_ids = set(remaining_ids[:n_only_ref1])
             only_ref2_ids = set(remaining_ids[n_only_ref1:n_only_ref1 + n_only_ref2])
-            both_refs_ids = set(remaining_ids[n_only_ref1 + n_only_ref2:])
         elif len(remaining_ids) == 1:
-            # With only 1 remaining, randomly assign to ref1 or ref2
             if np.random.rand() < 0.5:
                 only_ref1_ids = set(remaining_ids)
             else:
                 only_ref2_ids = set(remaining_ids)
-        
-        # Build removal sets based on allocation
-        # Remove from ref1: target-only + only_ref2
+
         remove_ref1 = target_only_ids | only_ref2_ids
-        # Remove from ref2: target-only + only_ref1
         remove_ref2 = target_only_ids | only_ref1_ids
-        
-        # Initialize ground truth mask
+
         gt_mask = np.zeros((h, w), dtype=np.float32)
-        
-        # Now render defects directly on the patch
-        for i, params in enumerate(defect_params):
-            # Generate defect directly in patch coordinates
-            local_defect, bounds = create_local_gaussian_defect(
-                center=params['center'],
-                size=params['size'],
-                sigma=params['sigma'],
-                patch_shape=(h, w),
-                patch_offset=(0, 0)  # No offset needed since we're working in patch coordinates
-            )
-            
-            if local_defect is None:
-                continue  # Should not happen with proper margin
-            
-            # Apply to channels based on pre-determined assignment
-            intensity = params['intensity']
-            
-            # Target always gets the defect
+
+        for i, (local_defect, bounds, intensity) in enumerate(defects):
             target = apply_local_defect_to_background(target, local_defect, bounds, intensity)
-            
-            # Ref1: only if not in remove_ref1
             if i not in remove_ref1:
                 ref1 = apply_local_defect_to_background(ref1, local_defect, bounds, intensity)
-            
-            # Ref2: only if not in remove_ref2
             if i not in remove_ref2:
                 ref2 = apply_local_defect_to_background(ref2, local_defect, bounds, intensity)
-            
-            # Ground truth mask: only if this is a target-only defect
             if i in target_only_ids:
                 local_mask = create_binary_mask(local_defect, threshold=0.1)
                 y_start, y_end, x_start, x_end = bounds
                 gt_mask[y_start:y_end, x_start:x_end] = np.maximum(
-                    gt_mask[y_start:y_end, x_start:x_end],
-                    local_mask
+                    gt_mask[y_start:y_end, x_start:x_end], local_mask
                 )
-        
+
         return target, ref1, ref2, gt_mask

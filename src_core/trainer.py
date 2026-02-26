@@ -221,12 +221,19 @@ def train_on_device(args):
     criterion = FocalLoss(alpha=0.75, gamma=args.gamma_start)
     print(f"Using Focal Loss with alpha=0.75, gamma schedule: [{args.gamma_start}, {args.gamma_end}] (cosine)")
     
+    psf_config_paths = None
+    if args.defect_mode == 'psf':
+        defects_dir = os.path.join(os.path.dirname(__file__), 'defects')
+        psf_config_paths = [os.path.join(defects_dir, f'{t}.yaml') for t in args.psf_type]
+
     dataset = Dataset(
         training_path=args.training_dataset_path,
         patch_size=patch_size,
         num_defects_range=args.num_defects_range,
         img_format=args.img_format,
-        cache_size=args.cache_size
+        cache_size=args.cache_size,
+        defect_mode=args.defect_mode,
+        psf_config_paths=psf_config_paths
     )
     
     dataloader = DataLoader(dataset, batch_size=args.bs, shuffle=True, num_workers=7)
@@ -327,6 +334,10 @@ def main():
                         help='Starting gamma value for focal loss (default: 1.0)')
     parser.add_argument('--gamma_end', type=float, default=3.0,
                         help='Ending gamma value for focal loss (default: 3.0)')
+    parser.add_argument('--defect_mode', type=str, choices=['gaussian', 'psf'], default='gaussian',
+                        help='Defect generation mode')
+    parser.add_argument('--psf_type', type=str, nargs='+', default=None,
+                        help='PSF config name(s) in defects/ (e.g., type1 type2)')
 
     args = parser.parse_args()
     
