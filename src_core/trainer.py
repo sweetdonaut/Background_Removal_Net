@@ -11,7 +11,7 @@ import random
 from sklearn.metrics import roc_auc_score
 from loss import FocalLoss
 from model import SegmentationNetwork
-from dataloader import Dataset, calculate_positions
+from dataloader import Dataset, calculate_positions, ensure_hwc, ensure_3ch
 
 def get_lr(optimizer):
     for param_group in optimizer.param_groups:
@@ -39,61 +39,39 @@ def get_focal_gamma(epoch, total_epochs, gamma_start, gamma_end, schedule='cosin
         raise ValueError(f"Unknown schedule: {schedule}")
     return gamma
 
-def evaluate_model(model, valid_root, ground_truth_root, img_format, patch_size, device, image_type):
-    """
-    Evaluate model on validation set and calculate AUROC using adaptive window
-    Args:
-        valid_root: root path containing 'good' and 'bright_spots' folders
-        ground_truth_root: root path containing ground truth masks
-        patch_size: size of patches to extract
-        image_type: type of images to determine expected size
-        min_overlap_ratio: minimum overlap ratio between patches
-    """
+def evaluate_model(model, valid_root, ground_truth_root, img_format, patch_size, device):
     model.eval()
-    
+
     all_scores = []
     all_labels = []
     pixel_scores = []
     pixel_labels = []
-    
+
     with torch.no_grad():
-        # Process both good and bright_spots categories
         for category in ['good', 'bright_spots']:
             category_path = os.path.join(valid_root, category)
             if not os.path.exists(category_path):
                 continue
-                
-            # Get validation images
+
             if img_format == 'png_jpg':
                 valid_images = glob.glob(os.path.join(category_path, "*.png"))
                 valid_images.extend(glob.glob(os.path.join(category_path, "*.jpg")))
             else:
                 valid_images = glob.glob(os.path.join(category_path, "*.tiff"))
                 valid_images.extend(glob.glob(os.path.join(category_path, "*.tif")))
-            
-            # Process each image
+
             for img_path in valid_images:
-                # Load image
                 if img_format == 'tiff':
                     image = tifffile.imread(img_path)
-                    # TIFF files should already be float32
                 else:
                     image = cv2.imread(img_path)
-                    # Keep as uint8, will convert when normalizing
-                
+
                 if image is None:
                     print(f"Warning: Failed to load image {img_path}")
                     continue
-                
-                # Convert from CHW to HWC format for stripe dataset
-                # Support both 3-channel and 4-channel images (4th channel is mask, ignored)
-                if image_type == 'strip' and (image.shape[0] == 3 or image.shape[0] == 4):
-                    image = np.transpose(image, (1, 2, 0))
 
-                # Keep only first 3 channels (target, ref1, ref2)
-                # If 4-channel image, discard the 4th mask channel
-                if len(image.shape) == 3 and image.shape[2] == 4:
-                    image = image[:, :, :3]
+                image = ensure_hwc(image)
+                image = ensure_3ch(image)
 
                 h, w = image.shape[:2]
                 
@@ -222,13 +200,9 @@ def train_on_device(args):
         device = torch.device('cpu')
         print("Using CPU")
     
-    # Determine patch size based on image type
-    if args.image_type == 'strip':
-        patch_size = (128, 128)
-    else:  # square
-        patch_size = (128, 128)
-    
-    run_name = f'BgRemoval_lr{args.lr}_ep{args.epochs}_bs{args.bs}_{patch_size[0]}x{patch_size[1]}_{args.image_type}'
+    patch_size = (args.patch_size, args.patch_size)
+
+    run_name = f'BgRemoval_lr{args.lr}_ep{args.epochs}_bs{args.bs}_{patch_size[0]}x{patch_size[1]}'
     
     # Single segmentation network for 3-channel input
     model_seg = SegmentationNetwork(in_channels=3, out_channels=2)
@@ -252,7 +226,6 @@ def train_on_device(args):
         patch_size=patch_size,
         num_defects_range=args.num_defects_range,
         img_format=args.img_format,
-        image_type=args.image_type,
         cache_size=args.cache_size
     )
     
@@ -310,8 +283,8 @@ def train_on_device(args):
             
             if os.path.exists(valid_root):
                 image_auroc, pixel_auroc = evaluate_model(
-                    model_seg, valid_root, ground_truth_root, 
-                    args.img_format, patch_size, device, args.image_type
+                    model_seg, valid_root, ground_truth_root,
+                    args.img_format, patch_size, device
                 )
                 print(f' - Image AUROC: {image_auroc:.4f} - Pixel AUROC: {pixel_auroc:.4f}')
             else:
@@ -324,7 +297,6 @@ def train_on_device(args):
             'model_state_dict': model_seg.state_dict(),
             'img_height': patch_size[0],
             'img_width': patch_size[1],
-            'image_type': args.image_type,
             'epoch': epoch,
             'seed': args.seed
         }
@@ -338,8 +310,7 @@ def main():
     parser.add_argument('--gpu_id', action='store', type=int, default=0, 
                         help='GPU ID to use. Set to -1 to use CPU')
     parser.add_argument('--checkpoint_path', action='store', type=str, required=True, help='Path to save checkpoints')
-    parser.add_argument('--image_type', action='store', type=str, choices=['strip', 'square'],
-                        default='square', help='Image type: strip (128x128), square (256x256)')
+    parser.add_argument('--patch_size', type=int, default=128, help='Patch size for training (default: 128)')
     parser.add_argument('--num_defects_range', action='store', type=int, nargs=2, default=[3, 8],
                         help='Range of number of defects to generate [min, max]')
     parser.add_argument('--training_dataset_path', action='store', type=str, required=True,

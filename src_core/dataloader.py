@@ -16,6 +16,20 @@ from functools import lru_cache
 import psutil
 
 
+def ensure_hwc(image):
+    """Auto-detect and convert CHW to HWC if needed."""
+    if len(image.shape) == 3 and image.shape[0] in (3, 4) and image.shape[1] > 4 and image.shape[2] > 4:
+        return np.transpose(image, (1, 2, 0))
+    return image
+
+
+def ensure_3ch(image):
+    """Keep only first 3 channels, discard 4th if present."""
+    if len(image.shape) == 3 and image.shape[2] == 4:
+        return image[:, :, :3]
+    return image
+
+
 def calculate_positions(img_size, patch_size, min_patches=2):
     """Calculate patch positions: minimum overlap, maximum coverage
     
@@ -51,23 +65,20 @@ class Dataset(Dataset):
     Uses systematic sliding window to ensure all parts of images are used
     """
     
-    def __init__(self, training_path, patch_size=(256, 256), 
-                 num_defects_range=(3, 8), defect_size_range=(3, 5),
-                 img_format='tiff', image_type='strip', cache_size=0):
+    def __init__(self, training_path, patch_size=(128, 128),
+                 num_defects_range=(3, 8),
+                 img_format='tiff', cache_size=0):
         """
         Args:
             training_path: Path to training images (required)
             patch_size: Size of patches to extract (height, width)
             num_defects_range: (min, max) number of defects per patch (default 3-8)
-            defect_size_range: Not used anymore, we use fixed 3x3 and 3x5
             img_format: Image format to load ('png_jpg' or 'tiff')
-            image_type: Type of images ('strip', 'square')
             cache_size: Number of images to cache (0 = no cache)
         """
         self.patch_size = patch_size
         self.num_defects_range = num_defects_range
         self.img_format = img_format
-        self.image_type = image_type
         self.cache_size = cache_size
         
         # Warning for small defect numbers
@@ -117,100 +128,50 @@ class Dataset(Dataset):
             return cv2.imread(img_path)
 
     def _detect_and_display_image_info(self):
-        """
-        Detect image size from first image and display data type info
-        For square type, auto-detect size; for strip/mvtec, use fixed sizes
-        """
+        """Auto-detect image size and format from first image."""
         print("\n" + "="*60)
         print("Dataset Image Information")
         print("="*60)
 
-        # Load first image to get info
         first_img_path = self.training_paths[0]
         sample_image = self._load_image(first_img_path)
 
         if sample_image is None:
             raise ValueError(f"Failed to load first image: {first_img_path}")
 
-        # Display raw image info (before any processing)
         print(f"Sample image: {os.path.basename(first_img_path)}")
         print(f"Raw shape: {sample_image.shape}")
         print(f"Data type: {sample_image.dtype}")
         print(f"Value range: [{sample_image.min():.2f}, {sample_image.max():.2f}]")
 
-        # Process image same as in __getitem__ to get actual size
-        image = sample_image
-
-        # Convert from CHW to HWC format for stripe dataset
-        if self.image_type == 'strip' and (image.shape[0] == 3 or image.shape[0] == 4):
-            image = np.transpose(image, (1, 2, 0))
+        image = ensure_hwc(sample_image)
+        if image.shape != sample_image.shape:
             print(f"After CHW->HWC conversion: {image.shape}")
 
-        # Keep only first 3 channels
-        if len(image.shape) == 3 and image.shape[2] == 4:
-            image = image[:, :, :3]
-            print(f"After removing 4th channel: {image.shape}")
+        image = ensure_3ch(image)
 
-        # Get final dimensions
-        if len(image.shape) == 3:
-            img_h, img_w, num_channels = image.shape
-            print(f"Final processed shape: {img_h} x {img_w} x {num_channels} channels")
-        else:
-            img_h, img_w = image.shape
-            num_channels = 1
-            print(f"Final processed shape: {img_h} x {img_w} (grayscale)")
-
-        # For square type, store detected size for later use
-        if self.image_type == 'square':
-            self.detected_img_h = img_h
-            self.detected_img_w = img_w
-            print(f"\n✓ Auto-detected square image size: {img_h} x {img_w}")
-
-            # Verify it's actually square
-            if img_h != img_w:
-                print(f"⚠ Warning: image_type is 'square' but detected size is not square ({img_h} x {img_w})")
-
+        img_h, img_w = image.shape[:2]
+        self.detected_img_h = img_h
+        self.detected_img_w = img_w
+        print(f"Image size: {img_h} x {img_w}")
         print("="*60 + "\n")
     
     def _setup_patch_positions(self):
-        """Setup patch positions for dynamic calculation"""
-        # Determine image size based on image_type
-        if self.image_type == 'strip':
-            img_h, img_w = 976, 176
-        elif self.image_type == 'square':
-            # Use auto-detected size for square images
-            if hasattr(self, 'detected_img_h') and hasattr(self, 'detected_img_w'):
-                img_h, img_w = self.detected_img_h, self.detected_img_w
-            else:
-                # Fallback to default if detection failed
-                img_h, img_w = 600, 600
-                print(f"⚠ Warning: Could not detect square image size, using default 600x600")
-        else:
-            raise ValueError(f"Unknown image_type: {self.image_type}. Must be 'strip' or 'square'")
+        """Setup patch positions from auto-detected image size."""
+        img_h, img_w = self.detected_img_h, self.detected_img_w
 
-        print(f"Using image size {img_h}x{img_w} for image_type: {self.image_type}")
-        
-        # Calculate positions for height and width
-        if self.image_type == 'strip':
-            # For strip images, use 9 patches in Y direction
-            self.y_positions = calculate_positions(img_h, self.patch_size[0], min_patches=9)
-            self.x_positions = calculate_positions(img_w, self.patch_size[1])
-        else:  # square
-            # For square images, use 4 patches in both directions (ensures overlap for 384x384)
-            self.y_positions = calculate_positions(img_h, self.patch_size[0], min_patches=4)
-            self.x_positions = calculate_positions(img_w, self.patch_size[1], min_patches=4)
-        
+        self.y_positions = calculate_positions(img_h, self.patch_size[0])
+        self.x_positions = calculate_positions(img_w, self.patch_size[1])
+
         if self.y_positions is None or self.x_positions is None:
             raise ValueError(f"Image size {img_h}x{img_w} is smaller than patch size {self.patch_size}")
-        
-        print(f"Patch positions - Y: {len(self.y_positions)} positions {self.y_positions[:3]}{'...' if len(self.y_positions) > 3 else ''}")
-        print(f"Patch positions - X: {len(self.x_positions)} positions {self.x_positions[:3]}{'...' if len(self.x_positions) > 3 else ''}")
-        
-        # Calculate total patches info
+
         self.patches_per_image = len(self.y_positions) * len(self.x_positions)
         self.total_patches = len(self.training_paths) * self.patches_per_image
-        
-        print(f"Total patches: {self.total_patches} ({self.patches_per_image} patches per image from {len(self.training_paths)} images)")
+
+        print(f"Patch positions - Y: {len(self.y_positions)} positions {self.y_positions}")
+        print(f"Patch positions - X: {len(self.x_positions)} positions {self.x_positions}")
+        print(f"Total patches: {self.total_patches} ({self.patches_per_image}/image x {len(self.training_paths)} images)")
     
     def __len__(self):
         return self.total_patches
@@ -235,15 +196,8 @@ class Dataset(Dataset):
         if image is None:
             raise ValueError(f"Failed to load image: {img_path}")
         
-        # Convert from CHW to HWC format for stripe dataset
-        # Support both 3-channel and 4-channel images (4th channel is mask, ignored)
-        if self.image_type == 'strip' and (image.shape[0] == 3 or image.shape[0] == 4):
-            image = np.transpose(image, (1, 2, 0))
-
-        # Keep only first 3 channels (target, ref1, ref2)
-        # If 4-channel image, discard the 4th mask channel
-        if image.shape[2] == 4:
-            image = image[:, :, :3]
+        image = ensure_hwc(image)
+        image = ensure_3ch(image)
 
         # Normalize to 0-255 range if needed (handles raw sensor values)
         image = image.astype(np.float32)
