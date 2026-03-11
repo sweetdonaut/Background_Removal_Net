@@ -3,6 +3,7 @@ from torch.utils.data import Dataset
 import numpy as np
 import cv2
 import os
+import io
 from glob import glob
 import tifffile
 from gaussian import (
@@ -13,6 +14,37 @@ from gaussian import (
 from generate_psf import load_config as load_psf_config, create_psf_defect
 from functools import lru_cache
 import psutil
+
+
+def parse_s3_path(s3_path):
+    """Parse 's3://bucket/prefix/...' into (bucket, prefix)."""
+    path = s3_path.replace('s3://', '', 1)
+    parts = path.split('/', 1)
+    bucket = parts[0]
+    prefix = parts[1] if len(parts) > 1 else ''
+    return bucket, prefix
+
+
+def list_s3_objects(bucket, prefix, img_format):
+    """List image keys from S3 bucket with given prefix."""
+    import boto3
+    endpoint_url = os.environ.get('S3_ENDPOINT_URL')
+    client = boto3.client('s3', endpoint_url=endpoint_url)
+
+    if img_format == 'tiff':
+        extensions = ('.tiff', '.tif')
+    else:
+        extensions = ('.png', '.jpg')
+
+    keys = []
+    paginator = client.get_paginator('list_objects_v2')
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for obj in page.get('Contents', []):
+            key = obj['Key']
+            if key.lower().endswith(extensions):
+                keys.append(key)
+
+    return [f's3://{bucket}/{k}' for k in sorted(keys)]
 
 
 def ensure_hwc(image):
@@ -88,20 +120,25 @@ class Dataset(Dataset):
             print("This may result in limited target-only defects. Recommended minimum: 3")
         
         # Load training images
-        if not os.path.exists(training_path):
-            raise ValueError(f"Training path does not exist: {training_path}")
-        
-        # Load images based on format
-        if img_format == 'png_jpg':
-            self.training_paths = glob(os.path.join(training_path, "*.png"))
-            self.training_paths.extend(glob(os.path.join(training_path, "*.jpg")))
-        elif img_format == 'tiff':
-            self.training_paths = glob(os.path.join(training_path, "*.tiff"))
-            self.training_paths.extend(glob(os.path.join(training_path, "*.tif")))
-        
+        self.is_s3 = training_path.startswith('s3://')
+
+        if self.is_s3:
+            bucket, prefix = parse_s3_path(training_path)
+            self.training_paths = list_s3_objects(bucket, prefix, img_format)
+            print(f"S3 source: {training_path}")
+        else:
+            if not os.path.exists(training_path):
+                raise ValueError(f"Training path does not exist: {training_path}")
+            if img_format == 'png_jpg':
+                self.training_paths = glob(os.path.join(training_path, "*.png"))
+                self.training_paths.extend(glob(os.path.join(training_path, "*.jpg")))
+            elif img_format == 'tiff':
+                self.training_paths = glob(os.path.join(training_path, "*.tiff"))
+                self.training_paths.extend(glob(os.path.join(training_path, "*.tif")))
+
         if len(self.training_paths) == 0:
             raise ValueError(f"No images found in {training_path}")
-        
+
         print(f"Found {len(self.training_paths)} training images")
 
         # Setup image cache if requested
@@ -121,12 +158,31 @@ class Dataset(Dataset):
         else:
             self._load_image = self._load_image_uncached
 
+    def _get_s3_client(self):
+        """Lazy-init per-worker S3 client (not fork-safe, so created on demand)."""
+        if not hasattr(self, '_s3_client'):
+            import boto3
+            endpoint_url = os.environ.get('S3_ENDPOINT_URL')
+            self._s3_client = boto3.client('s3', endpoint_url=endpoint_url)
+        return self._s3_client
+
     def _load_image_uncached(self, img_path):
-        """Load image without caching"""
-        if self.img_format == 'tiff':
-            return tifffile.imread(img_path)
+        """Load image from local filesystem or S3."""
+        if img_path.startswith('s3://'):
+            bucket, key = parse_s3_path(img_path)
+            client = self._get_s3_client()
+            response = client.get_object(Bucket=bucket, Key=key)
+            data = response['Body'].read()
+            if self.img_format == 'tiff':
+                return tifffile.imread(io.BytesIO(data))
+            else:
+                arr = np.frombuffer(data, dtype=np.uint8)
+                return cv2.imdecode(arr, cv2.IMREAD_COLOR)
         else:
-            return cv2.imread(img_path)
+            if self.img_format == 'tiff':
+                return tifffile.imread(img_path)
+            else:
+                return cv2.imread(img_path)
 
     def _detect_and_display_image_info(self):
         """Auto-detect image size and format from first image."""

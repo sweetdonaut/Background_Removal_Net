@@ -236,7 +236,8 @@ def train_on_device(args):
         psf_config_paths=psf_config_paths
     )
     
-    dataloader = DataLoader(dataset, batch_size=args.bs, shuffle=True, num_workers=7)
+    dataloader = DataLoader(dataset, batch_size=args.bs, shuffle=True,
+                            num_workers=args.num_workers, prefetch_factor=args.prefetch_factor)
     print(f"Dataset size: {len(dataset)} samples per epoch")
     
     num_batches = len(dataloader)
@@ -338,6 +339,10 @@ def main():
                         help='Defect generation mode')
     parser.add_argument('--psf_type', type=str, nargs='+', default=None,
                         help='PSF config name(s) in defects/ (e.g., type1 type2)')
+    parser.add_argument('--num_workers', type=int, default=7,
+                        help='Number of DataLoader workers (default: 7)')
+    parser.add_argument('--prefetch_factor', type=int, default=2,
+                        help='Batches prefetched per worker (default: 2, increase for S3)')
 
     args = parser.parse_args()
     

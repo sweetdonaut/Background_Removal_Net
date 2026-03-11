@@ -103,6 +103,40 @@ python trainer.py \
     --defect_mode psf --psf_type type1 type2
 ```
 
+### S3 Training
+
+Dataloader supports loading images directly from S3 (or S3-compatible storage).
+Just replace `--training_dataset_path` with an `s3://` path.
+
+**Step 1: Set environment variables**
+
+```bash
+# S3 credentials
+export AWS_ACCESS_KEY_ID=your_access_key
+export AWS_SECRET_ACCESS_KEY=your_secret_key
+
+# For S3-compatible storage (e.g., MinIO, Ceph), set endpoint URL
+# Omit this for AWS S3
+export S3_ENDPOINT_URL=https://s3g.yep.com.tw
+```
+
+**Step 2: Run training with S3 path**
+
+```bash
+python trainer.py \
+    --bs 16 --lr 0.001 --epochs 30 --gpu_id 0 \
+    --checkpoint_path ../checkpoints/4channel \
+    --patch_size 128 \
+    --training_dataset_path s3://my-bucket/data/train/good/ \
+    --img_format tiff \
+    --num_defects_range 4 10 \
+    --defect_mode gaussian \
+    --prefetch_factor 4
+```
+
+> **Tip:** Increase `--prefetch_factor` (default: 2) to overlap more S3 downloads with GPU training.
+> With `--num_workers 7 --prefetch_factor 4`, up to 28 batches are prefetched in parallel.
+
 ### Training Parameters
 
 | Parameter | Description | Default |
@@ -118,6 +152,8 @@ python trainer.py \
 | `--psf_type` | PSF config name(s) in `defects/` | None |
 | `--gamma_start` | Focal loss gamma start | 1.0 |
 | `--gamma_end` | Focal loss gamma end | 3.0 |
+| `--num_workers` | Number of DataLoader workers | 7 |
+| `--prefetch_factor` | Batches prefetched per worker | 2 |
 
 ### Output
 
