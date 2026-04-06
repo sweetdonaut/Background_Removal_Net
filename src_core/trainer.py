@@ -233,7 +233,8 @@ def train_on_device(args):
         img_format=args.img_format,
         cache_size=args.cache_size,
         defect_mode=args.defect_mode,
-        psf_config_paths=psf_config_paths
+        psf_config_paths=psf_config_paths,
+        psf_pool_size=args.psf_pool_size
     )
     
     dataloader = DataLoader(dataset, batch_size=args.bs, shuffle=True,
@@ -339,6 +340,8 @@ def main():
                         help='Defect generation mode')
     parser.add_argument('--psf_type', type=str, nargs='+', default=None,
                         help='PSF config name(s) in defects/ (e.g., type1 type2)')
+    parser.add_argument('--psf_pool_size', type=int, default=1000,
+                        help='Number of pre-generated PSF defects per type (default: 1000)')
     parser.add_argument('--num_workers', type=int, default=7,
                         help='Number of DataLoader workers (default: 7)')
     parser.add_argument('--prefetch_factor', type=int, default=2,

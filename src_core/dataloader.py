@@ -89,17 +89,47 @@ def calculate_positions(img_size, patch_size, min_patches=2):
         return positions.tolist()
 
 
+class PsfDefectPool:
+    """Pre-generated pool of PSF defects for efficient training."""
+
+    def __init__(self, psf_cfgs, pool_size=1000):
+        self.pools = []
+        print(f"Pre-generating PSF defect pool ({pool_size} per type)...")
+        for i, cfg in enumerate(psf_cfgs):
+            pool = []
+            failures = 0
+            while len(pool) < pool_size:
+                defect = create_psf_defect(cfg)
+                if defect is not None:
+                    pool.append(defect)
+                else:
+                    failures += 1
+                    if failures > pool_size * 10:
+                        raise RuntimeError(
+                            f"PSF config {i}: too many generation failures "
+                            f"({failures} failures, {len(pool)} successes)")
+            self.pools.append(pool)
+            print(f"  Type {i}: {pool_size} defects ready")
+        self.num_types = len(self.pools)
+
+    def sample(self):
+        cfg_idx = np.random.randint(self.num_types)
+        defect_idx = np.random.randint(len(self.pools[cfg_idx]))
+        return self.pools[cfg_idx][defect_idx]
+
+
 class Dataset(Dataset):
     """
     General dataset for defect detection training
     Generates target, ref1, ref2 images with synthetic defects
     Uses systematic sliding window to ensure all parts of images are used
     """
-    
+
     def __init__(self, training_path, patch_size=(128, 128),
                  num_defects_range=(3, 8),
                  img_format='tiff', cache_size=0,
-                 defect_mode='gaussian', psf_config_paths=None):
+                 defect_mode='gaussian', psf_config_paths=None,
+                 psf_pool_size=1000):
         self.patch_size = patch_size
         self.num_defects_range = num_defects_range
         self.img_format = img_format
@@ -109,8 +139,9 @@ class Dataset(Dataset):
         if defect_mode == 'psf':
             if not psf_config_paths:
                 raise ValueError("psf_config_paths required for psf defect mode")
-            self.psf_cfgs = [load_psf_config(p) for p in psf_config_paths]
-            print(f"Defect mode: PSF ({len(self.psf_cfgs)} types: {psf_config_paths})")
+            psf_cfgs = [load_psf_config(p) for p in psf_config_paths]
+            self.defect_pool = PsfDefectPool(psf_cfgs, pool_size=psf_pool_size)
+            print(f"Defect mode: PSF ({len(psf_cfgs)} types: {psf_config_paths})")
         else:
             print(f"Defect mode: Gaussian")
         
@@ -319,10 +350,7 @@ class Dataset(Dataset):
             return local_defect, bounds, intensity
 
         elif self.defect_mode == 'psf':
-            cfg = self.psf_cfgs[np.random.randint(len(self.psf_cfgs))]
-            cropped = create_psf_defect(cfg)
-            if cropped is None:
-                return None, None, None
+            cropped = self.defect_pool.sample()
             dh, dw = cropped.shape
             margin = 2
             max_y = h - dh - margin

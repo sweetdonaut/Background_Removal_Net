@@ -157,30 +157,26 @@ def visualize_results(image, heatmap, output_path):
     ax3.set_title('Ref2')
     ax3.axis('off')
 
-    diff1 = np.abs(target.astype(np.float32) - ref1.astype(np.float32))
+    diff1 = target.astype(np.float32) - ref1.astype(np.float32)
     ax4 = fig.add_subplot(gs[3])
-    d1_min, d1_max = diff1.min(), diff1.max()
-    if d1_max - d1_min < 1e-8:
-        d1_min, d1_max = 0, 255
-    ax4.imshow(diff1, cmap='hot', vmin=d1_min, vmax=d1_max)
+    d1_abs_max = max(abs(diff1.min()), abs(diff1.max()), 1e-8)
+    ax4.imshow(diff1, cmap='gray', vmin=-d1_abs_max, vmax=d1_abs_max)
     ax4.set_title('Target - Ref1')
     ax4.axis('off')
 
-    diff2 = np.abs(target.astype(np.float32) - ref2.astype(np.float32))
+    diff2 = target.astype(np.float32) - ref2.astype(np.float32)
     ax5 = fig.add_subplot(gs[4])
-    d2_min, d2_max = diff2.min(), diff2.max()
-    if d2_max - d2_min < 1e-8:
-        d2_min, d2_max = 0, 255
-    ax5.imshow(diff2, cmap='hot', vmin=d2_min, vmax=d2_max)
+    d2_abs_max = max(abs(diff2.min()), abs(diff2.max()), 1e-8)
+    ax5.imshow(diff2, cmap='gray', vmin=-d2_abs_max, vmax=d2_abs_max)
     ax5.set_title('Target - Ref2')
     ax5.axis('off')
 
-    double_detection = np.minimum(diff1, diff2)
+    abs_diff1 = np.abs(diff1)
+    abs_diff2 = np.abs(diff2)
+    double_detection = np.where(abs_diff1 <= abs_diff2, diff1, diff2)
     ax6 = fig.add_subplot(gs[5])
-    dd_min, dd_max = double_detection.min(), double_detection.max()
-    if dd_max - dd_min < 1e-8:
-        dd_min, dd_max = 0, 255
-    ax6.imshow(double_detection, cmap='hot', vmin=dd_min, vmax=dd_max)
+    dd_abs_max = max(abs(double_detection.min()), abs(double_detection.max()), 1e-8)
+    ax6.imshow(double_detection, cmap='gray', vmin=-dd_abs_max, vmax=dd_abs_max)
     ax6.set_title('Double Det.')
     ax6.axis('off')
 
@@ -193,6 +189,41 @@ def visualize_results(image, heatmap, output_path):
     ax7.axis('off')
 
     plt.colorbar(im, ax=ax7, fraction=0.046, pad=0.04)
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close()
+
+
+def visualize_point_cloud(image, heatmap, output_path):
+    target = image[:, :, 0].astype(np.float32)
+    ref1 = image[:, :, 1].astype(np.float32)
+    ref2 = image[:, :, 2].astype(np.float32)
+
+    diff1 = target - ref1
+    diff2 = target - ref2
+    avg_diff = ((diff1 + diff2) / 2).flatten()
+
+    abs_diff1 = np.abs(diff1)
+    abs_diff2 = np.abs(diff2)
+    double_det = np.where(abs_diff1 <= abs_diff2, diff1, diff2).flatten()
+    heatmap_flat = heatmap.flatten()
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+
+    ax1.scatter(double_det, avg_diff, s=1, alpha=0.05, c='blue')
+    ax1.set_xlabel('Double Detection')
+    ax1.set_ylabel('(diff1 + diff2) / 2')
+    ax1.set_title('Double Det. vs Avg Diff')
+    ax1.axhline(y=0, color='gray', linestyle='--', linewidth=0.5)
+    ax1.axvline(x=0, color='gray', linestyle='--', linewidth=0.5)
+
+    ax2.scatter(heatmap_flat, avg_diff, s=1, alpha=0.05, c='red')
+    ax2.set_xlabel('Heatmap Score')
+    ax2.set_ylabel('(diff1 + diff2) / 2')
+    ax2.set_title('Heatmap vs Avg Diff')
+    ax2.axhline(y=0, color='gray', linestyle='--', linewidth=0.5)
+    ax2.axvline(x=0, color='gray', linestyle='--', linewidth=0.5)
+
     plt.tight_layout()
     plt.savefig(output_path, dpi=150, bbox_inches='tight')
     plt.close()
@@ -253,6 +284,8 @@ def inference(args):
             output_path = os.path.join(args.output_dir, f'{filename}_result.png')
 
         visualize_results(processed_image, heatmap, output_path)
+        cloud_path = output_path.replace('_result.png', '_cloud.png')
+        visualize_point_cloud(processed_image, heatmap, cloud_path)
         print(f"Saved result: {output_path}")
 
         if args.use_ground_truth_mask:
