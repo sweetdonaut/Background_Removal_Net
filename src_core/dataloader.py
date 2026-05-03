@@ -89,11 +89,37 @@ def calculate_positions(img_size, patch_size, min_patches=2):
         return positions.tolist()
 
 
+def sample_magnitude(spec):
+    """Sample defect intensity magnitude from a yaml spec.
+
+    Accepts:
+        scalar (int/float)             -> fixed value
+        [a, b] / (a, b)                -> uniform in single range
+        [[a1, b1], [a2, b2], ...]      -> equal-probability mixture across ranges
+    """
+    if isinstance(spec, (int, float)):
+        return float(spec)
+    if isinstance(spec, (list, tuple)):
+        if not spec:
+            raise ValueError("intensity_abs spec is empty")
+        if len(spec) == 2 and all(isinstance(v, (int, float)) for v in spec):
+            return float(np.random.uniform(spec[0], spec[1]))
+        if all(isinstance(r, (list, tuple)) and len(r) == 2
+               and all(isinstance(v, (int, float)) for v in r) for r in spec):
+            chosen = spec[np.random.randint(len(spec))]
+            return float(np.random.uniform(chosen[0], chosen[1]))
+    raise ValueError(
+        f"Invalid intensity_abs spec: {spec!r}. "
+        "Expected scalar, [a, b], or [[a1,b1], [a2,b2], ...]"
+    )
+
+
 class PsfDefectPool:
     """Pre-generated pool of PSF defects for efficient training."""
 
     def __init__(self, psf_cfgs, pool_size=1000):
         self.pools = []
+        self.cfgs = list(psf_cfgs)
         print(f"Pre-generating PSF defect pool ({pool_size} per type)...")
         for i, cfg in enumerate(psf_cfgs):
             pool = []
@@ -115,7 +141,7 @@ class PsfDefectPool:
     def sample(self):
         cfg_idx = np.random.randint(self.num_types)
         defect_idx = np.random.randint(len(self.pools[cfg_idx]))
-        return self.pools[cfg_idx][defect_idx]
+        return self.pools[cfg_idx][defect_idx], self.cfgs[cfg_idx]
 
 
 class Dataset(Dataset):
@@ -129,12 +155,14 @@ class Dataset(Dataset):
                  num_defects_range=(3, 8),
                  img_format='tiff', cache_size=0,
                  defect_mode='gaussian', psf_config_paths=None,
-                 psf_pool_size=1000):
+                 psf_pool_size=1000,
+                 intensity_abs=(60, 80)):
         self.patch_size = patch_size
         self.num_defects_range = num_defects_range
         self.img_format = img_format
         self.cache_size = cache_size
         self.defect_mode = defect_mode
+        self.intensity_abs = intensity_abs
 
         if defect_mode == 'psf':
             if not psf_config_paths:
@@ -333,9 +361,9 @@ class Dataset(Dataset):
         """Create one defect regardless of mode.
         Returns (local_defect_0to1, bounds, intensity) or (None, None, None).
         """
-        intensity = np.random.choice([-80, -60, 60, 80])
-
         if self.defect_mode == 'gaussian':
+            magnitude = sample_magnitude(self.intensity_abs)
+            intensity = magnitude if np.random.rand() < 0.5 else -magnitude
             margin = 5
             cx = np.random.randint(margin, w - margin)
             cy = np.random.randint(margin, h - margin)
@@ -350,7 +378,9 @@ class Dataset(Dataset):
             return local_defect, bounds, intensity
 
         elif self.defect_mode == 'psf':
-            cropped = self.defect_pool.sample()
+            cropped, cfg = self.defect_pool.sample()
+            magnitude = sample_magnitude(cfg.get('intensity_abs', self.intensity_abs))
+            intensity = magnitude if np.random.rand() < 0.5 else -magnitude
             dh, dw = cropped.shape
             margin = 2
             max_y = h - dh - margin

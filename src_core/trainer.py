@@ -2,16 +2,96 @@ import torch
 from torch.utils.data import DataLoader
 from torch import optim
 import os
+import shutil
 import argparse
 import numpy as np
 import cv2
 import glob
 import tifffile
 import random
+import matplotlib.pyplot as plt
 from sklearn.metrics import roc_auc_score
 from loss import FocalLoss
 from model import SegmentationNetwork
-from dataloader import Dataset, calculate_positions, ensure_hwc, ensure_3ch
+from dataloader import Dataset, sample_magnitude, calculate_positions, ensure_hwc, ensure_3ch
+
+
+def _render_defect_grid(defects, out_path, suptitle=None):
+    """Render a 3x5 grid of defect patches (centered + padded) with colorbars."""
+    if not defects:
+        print(f"Warning: no defects to render, skipping {out_path}")
+        return
+
+    max_h = max(d[0].shape[0] for d in defects)
+    max_w = max(d[0].shape[1] for d in defects)
+    abs_max = max(abs(d[1]) for d in defects)
+
+    rows, cols = 3, 5
+    fig, axes = plt.subplots(rows, cols, figsize=(16, 9))
+    if suptitle:
+        fig.suptitle(suptitle, fontsize=14, fontweight='bold')
+    for ax_idx, ax in enumerate(axes.flat):
+        if ax_idx >= len(defects):
+            ax.axis('off')
+            continue
+        local_defect, intensity = defects[ax_idx]
+        h, w = local_defect.shape
+        padded = np.zeros((max_h, max_w), dtype=np.float32)
+        py, px = (max_h - h) // 2, (max_w - w) // 2
+        padded[py:py + h, px:px + w] = local_defect
+        signed = padded * intensity
+        im = ax.imshow(signed, cmap='RdBu_r', vmin=-abs_max, vmax=abs_max, aspect='equal')
+        plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        ax.set_title(f'patch {ax_idx + 1} ({h}x{w}, x{intensity:+.1f})', fontsize=9)
+        ax.set_xticks([]); ax.set_yticks([])
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=120, bbox_inches='tight')
+    plt.close()
+    print(f"Saved defect examples: {out_path}")
+
+
+def save_training_artifacts(checkpoint_path, dataset, psf_config_paths, n_patches=15):
+    """Save reproducibility artifacts alongside the checkpoints.
+
+    - Copies any PSF yaml configs used (preserves comments and filenames).
+    - Renders n_patches example defect patches per type, with colorbars,
+      so brightness ranges and defect appearance are recoverable later.
+    """
+    if psf_config_paths:
+        for src in psf_config_paths:
+            shutil.copy(src, os.path.join(checkpoint_path, os.path.basename(src)))
+
+    state = np.random.get_state()
+
+    if dataset.defect_mode == 'psf':
+        for type_idx, cfg_path in enumerate(psf_config_paths):
+            type_name = os.path.splitext(os.path.basename(cfg_path))[0]
+            pool = dataset.defect_pool.pools[type_idx]
+            cfg = dataset.defect_pool.cfgs[type_idx]
+            intensity_spec = cfg.get('intensity_abs', dataset.intensity_abs)
+
+            defects = []
+            for _ in range(n_patches):
+                d = pool[np.random.randint(len(pool))]
+                magnitude = sample_magnitude(intensity_spec)
+                intensity = magnitude if np.random.rand() < 0.5 else -magnitude
+                defects.append((d, intensity))
+
+            out = os.path.join(checkpoint_path, f'defect_examples_{type_name}.png')
+            _render_defect_grid(defects, out, suptitle=type_name)
+    else:
+        H = W = 200
+        defects = []
+        attempts = 0
+        while len(defects) < n_patches and attempts < n_patches * 30:
+            local_defect, _, intensity = dataset._create_one_defect(H, W)
+            if local_defect is not None:
+                defects.append((local_defect, intensity))
+            attempts += 1
+        out = os.path.join(checkpoint_path, 'defect_examples.png')
+        _render_defect_grid(defects, out)
+
+    np.random.set_state(state)
 
 def get_lr(optimizer):
     for param_group in optimizer.param_groups:
@@ -240,7 +320,9 @@ def train_on_device(args):
     dataloader = DataLoader(dataset, batch_size=args.bs, shuffle=True,
                             num_workers=args.num_workers, prefetch_factor=args.prefetch_factor)
     print(f"Dataset size: {len(dataset)} samples per epoch")
-    
+
+    save_training_artifacts(args.checkpoint_path, dataset, psf_config_paths)
+
     num_batches = len(dataloader)
     
     for epoch in range(args.epochs):
