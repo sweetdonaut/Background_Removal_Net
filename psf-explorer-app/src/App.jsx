@@ -48,7 +48,7 @@ function fftShift(a, N) {
   return o;
 }
 
-/* ═══════════════════ COLORMAP (inferno) ═══════════════════ */
+/* ═══════════════════ COLORMAP ═══════════════════ */
 const CMAP = [[0,0,4],[10,7,34],[28,16,68],[49,17,96],[72,12,104],[94,10,103],[115,15,97],[136,24,86],[155,37,72],[173,53,56],[189,71,40],[203,93,24],[214,117,10],[222,143,3],[227,170,18],[229,197,50],[228,224,93],[240,249,149],[252,255,164]];
 function cmap(val) {
   const t = Math.max(0, Math.min(1, val)) * (CMAP.length - 1);
@@ -69,10 +69,13 @@ function poissonSample(lam, rng) {
   const g = boxMullerRng(rng); return Math.max(0, Math.round(lam + Math.sqrt(lam) * g()));
 }
 
-/* ═══════════════════ RENDER HELPERS ═══════════════════ */
+/* ═══════════════════ RENDER ═══════════════════ */
 function renderArr(ctx, data, N, useLog) {
   let arr = data;
-  if (useLog) { const mx = Math.max(...data), fl = mx*1e-6; arr = data.map(v => Math.log10(Math.max(v, fl))); }
+  if (useLog) {
+    let mx = 0; for (let i = 0; i < data.length; i++) if (data[i] > mx) mx = data[i];
+    const fl = mx * 1e-6; arr = data.map(v => Math.log10(Math.max(v, fl)));
+  }
   let mn = Infinity, mx2 = -Infinity;
   for (let i = 0; i < arr.length; i++) { if (arr[i] < mn) mn = arr[i]; if (arr[i] > mx2) mx2 = arr[i]; }
   const rng = mx2 - mn || 1, img = ctx.createImageData(N, N);
@@ -114,7 +117,7 @@ function renderCropped(ctx, data, N, zoom, useLog) {
   ctx.imageSmoothingEnabled = false; ctx.drawImage(tmp, 0, 0, N, N);
 }
 
-/* ═══════════════════ UI COMPONENTS ═══════════════════ */
+/* ═══════════════════ UI ═══════════════════ */
 function Slider({label, sub, value, min, max, step, onChange}) {
   return (<div style={{marginBottom:12}}>
     <div style={{display:"flex",justifyContent:"space-between",alignItems:"baseline",marginBottom:3}}>
@@ -142,20 +145,24 @@ function Section({title, sub, children, open: initOpen = true, color = "#aaa"}) 
 
 /* ═══════════════════ MAIN ═══════════════════ */
 const N = 256;
+const S = N * N;
 
 export default function PSFExplorer() {
   // Aperture
   const [outerR, setOuterR] = useState(40);
   const [epsilon, setEpsilon] = useState(0.6);
+  const [squareEps, setSquareEps] = useState(0);
   const [ellipticity, setEllipticity] = useState(0);
   const [ellipAngle, setEllipAngle] = useState(0);
-
-  // Stripe masks
   const [hStripeW, setHStripeW] = useState(0);
   const [vStripeW, setVStripeW] = useState(0);
-  const [squareEps, setSquareEps] = useState(0);
   const [hOuterCrop, setHOuterCrop] = useState(0);
   const [vOuterCrop, setVOuterCrop] = useState(0);
+
+  // Vector mode
+  const [vectorMode, setVectorMode] = useState(false);
+  const [na, setNA] = useState(0.95);
+  const [polType, setPolType] = useState("linX");
 
   // Aberrations
   const [defocus, setDefocus] = useState(0);
@@ -181,13 +188,16 @@ export default function PSFExplorer() {
   const apertureRef = useRef(null);
   const phaseRef = useRef(null);
   const psfRef = useRef(null);
+  const exRef = useRef(null);
+  const eyRef = useRef(null);
+  const ezRef = useRef(null);
 
   const compute = useCallback(() => {
     const cx = N / 2, cy = N / 2;
     const innerR = outerR * epsilon;
 
-    // Build mask
-    const mask = new Float64Array(N * N);
+    // ── Build mask ──
+    const mask = new Float64Array(S);
     const cosA = Math.cos(ellipAngle * Math.PI / 180), sinA = Math.sin(ellipAngle * Math.PI / 180);
     const sX = 1 + ellipticity, sY = 1 - ellipticity;
     for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) {
@@ -196,41 +206,14 @@ export default function PSFExplorer() {
       const r = Math.sqrt(rx * rx + ry * ry);
       mask[y * N + x] = (r <= outerR && r >= innerR) ? 1 : 0;
     }
+    if (hStripeW > 0) { const h = outerR * hStripeW; for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) { if (Math.abs(y - cy) <= h) mask[y * N + x] = 0; } }
+    if (vStripeW > 0) { const h = outerR * vStripeW; for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) { if (Math.abs(x - cx) <= h) mask[y * N + x] = 0; } }
+    if (squareEps > 0) { const h = outerR * squareEps; for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) { if (Math.abs(x - cx) <= h && Math.abs(y - cy) <= h) mask[y * N + x] = 0; } }
+    if (hOuterCrop > 0) { const t = outerR * (1 - hOuterCrop); for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) { if (Math.abs(y - cy) > t) mask[y * N + x] = 0; } }
+    if (vOuterCrop > 0) { const t = outerR * (1 - vOuterCrop); for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) { if (Math.abs(x - cx) > t) mask[y * N + x] = 0; } }
 
-    // Apply stripe masks
-    if (hStripeW > 0) {
-      const halfH = outerR * hStripeW;
-      for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) {
-        if (Math.abs(y - cy) <= halfH) mask[y * N + x] = 0;
-      }
-    }
-    if (vStripeW > 0) {
-      const halfV = outerR * vStripeW;
-      for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) {
-        if (Math.abs(x - cx) <= halfV) mask[y * N + x] = 0;
-      }
-    }
-    if (squareEps > 0) {
-      const halfSq = outerR * squareEps;
-      for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) {
-        if (Math.abs(x - cx) <= halfSq && Math.abs(y - cy) <= halfSq) mask[y * N + x] = 0;
-      }
-    }
-    if (hOuterCrop > 0) {
-      const threshold = outerR * (1 - hOuterCrop);
-      for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) {
-        if (Math.abs(y - cy) > threshold) mask[y * N + x] = 0;
-      }
-    }
-    if (vOuterCrop > 0) {
-      const threshold = outerR * (1 - vOuterCrop);
-      for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) {
-        if (Math.abs(x - cx) > threshold) mask[y * N + x] = 0;
-      }
-    }
-
-    // Build phase
-    const phase = new Float64Array(N * N);
+    // ── Build phase ──
+    const phase = new Float64Array(S);
     for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) {
       const dx = (x - cx) / outerR, dy = (y - cy) / outerR;
       const rho2 = dx * dx + dy * dy, rho = Math.sqrt(rho2), th = Math.atan2(dy, dx);
@@ -246,50 +229,163 @@ export default function PSFExplorer() {
       phase[y * N + x] = p;
     }
 
-    // Pupil function → FFT → |.|²
-    const re = new Float64Array(N * N), im = new Float64Array(N * N);
-    for (let i = 0; i < N * N; i++) if (mask[i] > 0) {
-      re[i] = Math.cos(phase[i]); im[i] = Math.sin(phase[i]);
-    }
-    fft2d(re, im, N);
-    const psf = new Float64Array(N * N);
-    for (let i = 0; i < N * N; i++) psf[i] = re[i] * re[i] + im[i] * im[i];
-    const shifted = fftShift(psf, N);
+    // ── Render aperture & phase ──
+    const apCtx = apertureRef.current?.getContext("2d");
+    const phCtx = phaseRef.current?.getContext("2d");
+    if (apCtx) renderMask(apCtx, mask, N);
+    if (phCtx) renderPhase(phCtx, phase, mask, N);
 
-    // Brightness + noise
+    let shifted;
+
+    if (!vectorMode) {
+      // ── Scalar mode: single FFT ──
+      const re = new Float64Array(S), im = new Float64Array(S);
+      for (let i = 0; i < S; i++) if (mask[i] > 0) {
+        re[i] = Math.cos(phase[i]); im[i] = Math.sin(phase[i]);
+      }
+      fft2d(re, im, N);
+      const psf = new Float64Array(S);
+      for (let i = 0; i < S; i++) psf[i] = re[i] * re[i] + im[i] * im[i];
+      shifted = fftShift(psf, N);
+    } else {
+      // ── Vector mode: Richards-Wolf ──
+      // 3 components: (xRe,xIm), (yRe,yIm), (zRe,zIm)
+      const uxRe = new Float64Array(S), uxIm = new Float64Array(S);
+      const uyRe = new Float64Array(S), uyIm = new Float64Array(S);
+      const uzRe = new Float64Array(S), uzIm = new Float64Array(S);
+
+      const inv2 = 1 / Math.sqrt(2);
+
+      for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) {
+        const idx = y * N + x;
+        if (mask[idx] === 0) continue;
+
+        const dx = x - cx, dy = y - cy;
+        const rhoPixel = Math.sqrt(dx * dx + dy * dy);
+        const rhoNorm = rhoPixel / outerR; // 0 to 1
+        const sinTheta = rhoNorm * na;
+
+        // Outside valid angle range
+        if (sinTheta >= 1) { mask[idx] = 0; continue; }
+
+        const theta = Math.asin(sinTheta);
+        const cosTheta = Math.cos(theta);
+        const phi = Math.atan2(dy, dx);
+        const cosPhi = Math.cos(phi), sinPhi = Math.sin(phi);
+
+        // Apodization factor
+        const apod = Math.sqrt(cosTheta);
+
+        // Aberration phase: exp(i * phase)
+        const pVal = phase[idx];
+        const eRe = Math.cos(pVal), eIm = Math.sin(pVal);
+
+        // Input polarization (complex: pxR+i*pxI, pyR+i*pyI)
+        let pxR, pxI, pyR, pyI;
+        if (polType === "linX") { pxR = 1; pxI = 0; pyR = 0; pyI = 0; }
+        else if (polType === "linY") { pxR = 0; pxI = 0; pyR = 1; pyI = 0; }
+        else if (polType === "lin45") { pxR = inv2; pxI = 0; pyR = inv2; pyI = 0; }
+        else if (polType === "circR") { pxR = inv2; pxI = 0; pyR = 0; pyI = inv2; }
+        else if (polType === "circL") { pxR = inv2; pxI = 0; pyR = 0; pyI = -inv2; }
+        else if (polType === "radial") { pxR = cosPhi; pxI = 0; pyR = sinPhi; pyI = 0; }
+        else if (polType === "azimuthal") { pxR = -sinPhi; pxI = 0; pyR = cosPhi; pyI = 0; }
+        else { pxR = 1; pxI = 0; pyR = 0; pyI = 0; }
+
+        // Richards-Wolf rotation matrix (aplanatic lens)
+        const cos2phi = cosPhi * cosPhi, sin2phi = sinPhi * sinPhi;
+        const csphi = cosPhi * sinPhi;
+        const Axx = cosTheta * cos2phi + sin2phi;
+        const Axy = (cosTheta - 1) * csphi;
+        const Ayx = Axy; // symmetric
+        const Ayy = cosTheta * sin2phi + cos2phi;
+        const Azx = -sinTheta * cosPhi;
+        const Azy = -sinTheta * sinPhi;
+
+        // Apply rotation: out = A * p  (complex multiplication)
+        // outX = Axx*px + Axy*py  (Axx,Axy are real; px,py are complex)
+        const oxR = Axx * pxR + Axy * pyR;
+        const oxI = Axx * pxI + Axy * pyI;
+        const oyR = Ayx * pxR + Ayy * pyR;
+        const oyI = Ayx * pxI + Ayy * pyI;
+        const ozR = Azx * pxR + Azy * pyR;
+        const ozI = Azx * pxI + Azy * pyI;
+
+        // Multiply by apodization * exp(i*phase)
+        // (oxR+i*oxI) * apod * (eRe+i*eIm)
+        const a = apod;
+        uxRe[idx] = a * (oxR * eRe - oxI * eIm);
+        uxIm[idx] = a * (oxR * eIm + oxI * eRe);
+        uyRe[idx] = a * (oyR * eRe - oyI * eIm);
+        uyIm[idx] = a * (oyR * eIm + oyI * eRe);
+        uzRe[idx] = a * (ozR * eRe - ozI * eIm);
+        uzIm[idx] = a * (ozR * eIm + ozI * eRe);
+      }
+
+      // FFT each component
+      fft2d(uxRe, uxIm, N);
+      fft2d(uyRe, uyIm, N);
+      fft2d(uzRe, uzIm, N);
+
+      // |E|² for each component
+      const Ix = new Float64Array(S), Iy = new Float64Array(S), Iz = new Float64Array(S);
+      const total = new Float64Array(S);
+      for (let i = 0; i < S; i++) {
+        Ix[i] = uxRe[i] * uxRe[i] + uxIm[i] * uxIm[i];
+        Iy[i] = uyRe[i] * uyRe[i] + uyIm[i] * uyIm[i];
+        Iz[i] = uzRe[i] * uzRe[i] + uzIm[i] * uzIm[i];
+        total[i] = Ix[i] + Iy[i] + Iz[i];
+      }
+
+      const shiftIx = fftShift(Ix, N), shiftIy = fftShift(Iy, N), shiftIz = fftShift(Iz, N);
+      shifted = fftShift(total, N);
+
+      // Render component canvases
+      const exCtx = exRef.current?.getContext("2d");
+      const eyCtx = eyRef.current?.getContext("2d");
+      const ezCtx = ezRef.current?.getContext("2d");
+      if (exCtx) renderCropped(exCtx, shiftIx, N, zoom, useLog);
+      if (eyCtx) renderCropped(eyCtx, shiftIy, N, zoom, useLog);
+      if (ezCtx) renderCropped(ezCtx, shiftIz, N, zoom, useLog);
+    }
+
+    // ── Noise ──
     let sum = 0;
-    for (let i = 0; i < N * N; i++) sum += shifted[i];
+    for (let i = 0; i < S; i++) sum += shifted[i];
     const scale = sum > 0 ? brightness / sum : 1;
-    const final = new Float64Array(N * N);
+    const final_ = new Float64Array(S);
     const rng = mulberry32(noiseSeed);
     const gauss = boxMullerRng(rng);
-    for (let i = 0; i < N * N; i++) {
+    for (let i = 0; i < S; i++) {
       let v = shifted[i] * scale + background;
       if (poissonOn) v = poissonSample(Math.max(0, v), rng);
       if (gaussNoise > 0) v += gauss() * gaussNoise;
-      final[i] = Math.max(0, v);
+      final_[i] = Math.max(0, v);
     }
 
-    // Render
-    const apCtx = apertureRef.current?.getContext("2d");
-    const phCtx = phaseRef.current?.getContext("2d");
     const psCtx = psfRef.current?.getContext("2d");
-    if (apCtx) renderMask(apCtx, mask, N);
-    if (phCtx) renderPhase(phCtx, phase, mask, N);
-    if (psCtx) renderCropped(psCtx, final, N, zoom, useLog);
-  }, [outerR, epsilon, ellipticity, ellipAngle, hStripeW, vStripeW, squareEps, hOuterCrop, vOuterCrop, defocus, astigX, astigY, comaX, comaY, spherical, trefoilX, trefoilY, brightness, background, poissonOn, gaussNoise, noiseSeed, useLog, zoom]);
+    if (psCtx) renderCropped(psCtx, final_, N, zoom, useLog);
+  }, [outerR, epsilon, squareEps, ellipticity, ellipAngle, hStripeW, vStripeW, hOuterCrop, vOuterCrop,
+      vectorMode, na, polType,
+      defocus, astigX, astigY, comaX, comaY, spherical, trefoilX, trefoilY,
+      brightness, background, poissonOn, gaussNoise, noiseSeed, useLog, zoom]);
 
   useEffect(() => { compute(); }, [compute]);
 
   const hasAberrations = defocus !== 0 || astigX !== 0 || astigY !== 0 || comaX !== 0 || comaY !== 0 || spherical !== 0 || trefoilX !== 0 || trefoilY !== 0;
 
   const resetAll = () => {
-    setOuterR(40); setEpsilon(0.6); setEllipticity(0); setEllipAngle(0);
-    setHStripeW(0); setVStripeW(0); setSquareEps(0);
-    setHOuterCrop(0); setVOuterCrop(0);
+    setOuterR(40); setEpsilon(0.6); setSquareEps(0); setEllipticity(0); setEllipAngle(0);
+    setHStripeW(0); setVStripeW(0); setHOuterCrop(0); setVOuterCrop(0);
+    setNA(0.95); setPolType("linX");
     setDefocus(0); setAstigX(0); setAstigY(0); setComaX(0); setComaY(0);
     setSpherical(0); setTrefoilX(0); setTrefoilY(0);
     setBrightness(5000); setBackground(5); setPoissonOn(false); setGaussNoise(1.5); setNoiseSeed(42);
+  };
+
+  const polLabels = {
+    linX: "線偏振 X", linY: "線偏振 Y", lin45: "線偏振 45°",
+    circR: "右旋圓偏振", circL: "左旋圓偏振",
+    radial: "徑向偏振", azimuthal: "角向偏振",
   };
 
   return (
@@ -309,14 +405,14 @@ export default function PSFExplorer() {
           WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent",
         }}>環形光圈 PSF 探索器</h1>
         <p style={{ color: "#555", fontSize: 12, margin: "4px 0 0" }}>
-          PSF = | FT{'{'} M · exp(iφ) {'}'} |²
+          {vectorMode ? "Richards-Wolf 向量繞射理論 — PSF = |Ex|² + |Ey|² + |Ez|²" : "純量模型 — PSF = | FT{ M · exp(iφ) } |²"}
         </p>
       </div>
 
-      <div style={{ display: "flex", flexWrap: "wrap", gap: 20, maxWidth: 1000, margin: "0 auto", justifyContent: "center" }}>
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 20, maxWidth: 1060, margin: "0 auto", justifyContent: "center" }}>
         {/* ═══ CONTROLS ═══ */}
         <div style={{
-          flex: "1 1 290px", maxWidth: 330,
+          flex: "1 1 290px", maxWidth: 340,
           background: "rgba(255,255,255,0.03)", borderRadius: 12,
           border: "1px solid rgba(255,255,255,0.06)",
           padding: "16px 16px", maxHeight: "calc(100vh - 100px)", overflowY: "auto",
@@ -329,11 +425,47 @@ export default function PSFExplorer() {
             }}>重設全部</button>
           </div>
 
+          {/* Vector mode toggle */}
+          <div style={{
+            marginBottom: 12, padding: "10px 12px", borderRadius: 8,
+            background: vectorMode ? "rgba(244,114,182,0.08)" : "rgba(255,255,255,0.02)",
+            border: `1px solid ${vectorMode ? "rgba(244,114,182,0.2)" : "rgba(255,255,255,0.06)"}`,
+          }}>
+            <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer" }}>
+              <input type="checkbox" checked={vectorMode} onChange={e => setVectorMode(e.target.checked)}
+                style={{ accentColor: "#f472b6", width: 16, height: 16 }} />
+              <div>
+                <div style={{ color: "#e0e0e0", fontSize: 12.5, fontWeight: 600 }}>Richards-Wolf 向量模式</div>
+                <div style={{ color: "#666", fontSize: 10 }}>加入偏振、apodization、高 NA 效應</div>
+              </div>
+            </label>
+          </div>
+
+          {/* Polarization (only in vector mode) */}
+          {vectorMode && (
+            <Section title="偏振與 NA" sub="Polarization" color="#f472b6">
+              <Slider label="數值孔徑 NA" sub="numerical aperture" value={na} min={0.1} max={1.4} step={0.01} onChange={setNA} />
+              <div style={{ marginBottom: 12 }}>
+                <div style={{ color: "#e0e0e0", fontSize: 12, fontWeight: 600, marginBottom: 6 }}>偏振模式</div>
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
+                  {Object.entries(polLabels).map(([key, label]) => (
+                    <button key={key} onClick={() => setPolType(key)} style={{
+                      background: polType === key ? "rgba(244,114,182,0.2)" : "rgba(255,255,255,0.04)",
+                      border: `1px solid ${polType === key ? "rgba(244,114,182,0.4)" : "rgba(255,255,255,0.08)"}`,
+                      color: polType === key ? "#f472b6" : "#888",
+                      fontSize: 10, padding: "4px 8px", borderRadius: 5, cursor: "pointer", fontFamily: "inherit",
+                    }}>{label}</button>
+                  ))}
+                </div>
+              </div>
+            </Section>
+          )}
+
           {/* Aperture */}
           <Section title="環形光圈" sub="Aperture" color="#8bb4f0">
             <Slider label="外圈半徑" sub="outer R" value={outerR} min={15} max={80} step={1} onChange={setOuterR} />
-            <Slider label="圓形遮擋 ε" sub="circle obstruction" value={epsilon} min={0} max={0.95} step={0.01} onChange={setEpsilon} />
-            <Slider label="方形遮擋 ε" sub="square obstruction" value={squareEps} min={0} max={0.95} step={0.01} onChange={setSquareEps} />
+            <Slider label="圓形遮擋 ε" sub="circle" value={epsilon} min={0} max={0.95} step={0.01} onChange={setEpsilon} />
+            <Slider label="方形遮擋 ε" sub="square" value={squareEps} min={0} max={0.95} step={0.01} onChange={setSquareEps} />
             <Slider label="橢圓度" sub="ellipticity" value={ellipticity} min={0} max={0.3} step={0.01} onChange={setEllipticity} />
             <Slider label="橢圓角度" sub="degrees" value={ellipAngle} min={0} max={180} step={1} onChange={setEllipAngle} />
             <Slider label="水平遮擋條" sub="horizontal" value={hStripeW} min={0} max={1} step={0.01} onChange={setHStripeW} />
@@ -355,7 +487,7 @@ export default function PSFExplorer() {
           </Section>
 
           {/* Noise */}
-          <Section title="成像與雜訊" sub="Imaging & Noise" open={false} color="#34d399">
+          <Section title="成像與雜訊" sub="Noise" open={false} color="#34d399">
             <Slider label="亮度" sub="photons" value={brightness} min={10} max={10000} step={10} onChange={setBrightness} />
             <Slider label="背景值" sub="background" value={background} min={0} max={200} step={1} onChange={setBackground} />
             <label style={{ display: "flex", alignItems: "center", gap: 6, cursor: "pointer", marginBottom: 12 }}>
@@ -372,7 +504,7 @@ export default function PSFExplorer() {
         </div>
 
         {/* ═══ VISUALIZATIONS ═══ */}
-        <div style={{ flex: "1 1 360px", maxWidth: 580 }}>
+        <div style={{ flex: "1 1 380px", maxWidth: 640 }}>
           {/* Top: aperture + phase */}
           <div style={{ display: "flex", gap: 10, marginBottom: 10 }}>
             <div style={{ flex: 1 }}>
@@ -391,10 +523,30 @@ export default function PSFExplorer() {
             </div>
           </div>
 
+          {/* Vector components (only in vector mode) */}
+          {vectorMode && (
+            <div style={{ display: "flex", gap: 6, marginBottom: 10 }}>
+              {[
+                { ref: exRef, label: "|Ex|²", color: "#f472b6" },
+                { ref: eyRef, label: "|Ey|²", color: "#a78bfa" },
+                { ref: ezRef, label: "|Ez|²", color: "#fbbf24" },
+              ].map(({ ref, label, color }) => (
+                <div key={label} style={{ flex: 1 }}>
+                  <div style={{ background: "rgba(255,255,255,0.03)", borderRadius: 8, border: "1px solid rgba(255,255,255,0.06)", padding: 6, textAlign: "center" }}>
+                    <div style={{ fontSize: 10, color, marginBottom: 4, fontWeight: 600 }}>{label}</div>
+                    <canvas ref={ref} width={N} height={N} style={{ width: "100%", aspectRatio: "1", borderRadius: 4, imageRendering: "pixelated" }} />
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+
           {/* PSF result */}
           <div style={{ background: "rgba(255,255,255,0.03)", borderRadius: 10, border: "1px solid rgba(255,255,255,0.06)", padding: 10 }}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
-              <div style={{ fontSize: 13, color: "#ccc", fontWeight: 600 }}>PSF 結果</div>
+              <div style={{ fontSize: 13, color: "#ccc", fontWeight: 600 }}>
+                PSF 結果 {vectorMode && <span style={{ fontSize: 10, color: "#f472b6", fontWeight: 500, marginLeft: 6 }}>|Ex|²+|Ey|²+|Ez|²</span>}
+              </div>
               <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
                 <label style={{ display: "flex", alignItems: "center", gap: 4, cursor: "pointer", fontSize: 10.5, color: "#888" }}>
                   <input type="checkbox" checked={useLog} onChange={e => setUseLog(e.target.checked)} style={{ accentColor: "#fbbf24" }} />
@@ -417,11 +569,17 @@ export default function PSFExplorer() {
           {/* Tips */}
           <div style={{
             marginTop: 10, padding: "10px 14px", borderRadius: 8,
-            background: "rgba(139,180,240,0.04)", border: "1px solid rgba(139,180,240,0.1)",
-            fontSize: 11.5, color: "#888", lineHeight: 1.6,
+            background: vectorMode ? "rgba(244,114,182,0.04)" : "rgba(139,180,240,0.04)",
+            border: `1px solid ${vectorMode ? "rgba(244,114,182,0.1)" : "rgba(139,180,240,0.1)"}`,
+            fontSize: 11, color: "#888", lineHeight: 1.6,
           }}>
-            <strong style={{ color: "#8bb4f0" }}>使用提示：</strong>
-            先把像差歸零，只調光圈參數。接著一次調一種像差觀察效果。最後打開雜訊，比較模擬結果與真實影像。
+            {vectorMode ? (<>
+              <strong style={{ color: "#f472b6" }}>向量模式提示：</strong>
+              比較「線偏振 X」和「徑向偏振」的 PSF 大小差異。觀察 |Ez|² 在不同偏振下的變化——徑向偏振會產生很強的 z 分量。調高 NA 看偏振效應如何變大。
+            </>) : (<>
+              <strong style={{ color: "#8bb4f0" }}>使用提示：</strong>
+              開啟「Richards-Wolf 向量模式」可看到偏振和高 NA 對 PSF 的影響，並分別觀察 Ex、Ey、Ez 三個電場分量。
+            </>)}
           </div>
         </div>
       </div>
