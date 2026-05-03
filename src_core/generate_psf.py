@@ -38,6 +38,75 @@ def sample(rng, r):
     return r
 
 
+def _build_vector_pupil(mask, phase, x, y, outer_r, na, pol_type):
+    """Build Richards-Wolf vector pupil components (Ux, Uy, Uz).
+
+    Mirrors the vector-mode logic in psf-explorer-app/src/App.jsx. Pixels with
+    sin(theta) >= 1 (outside the valid angular range for the given NA) are
+    zeroed in the returned mask.
+    """
+    rho_pixel = np.sqrt(x ** 2 + y ** 2)
+    sin_theta = (rho_pixel / outer_r) * na
+
+    valid = (sin_theta < 1) & (mask > 0)
+    mask = valid.astype(np.float64)
+
+    sin_t = np.where(valid, sin_theta, 0.0)
+    cos_t = np.where(valid, np.sqrt(np.maximum(0.0, 1.0 - sin_t ** 2)), 0.0)
+    phi = np.arctan2(y, x)
+    cos_p, sin_p = np.cos(phi), np.sin(phi)
+    apod = np.sqrt(np.maximum(0.0, cos_t))
+
+    inv2 = 1.0 / np.sqrt(2.0)
+    zeros = np.zeros_like(phi)
+    ones = np.ones_like(phi)
+    if pol_type == "linX":
+        px_re, px_im, py_re, py_im = ones, zeros, zeros, zeros
+    elif pol_type == "linY":
+        px_re, px_im, py_re, py_im = zeros, zeros, ones, zeros
+    elif pol_type == "lin45":
+        px_re, px_im, py_re, py_im = np.full_like(phi, inv2), zeros, np.full_like(phi, inv2), zeros
+    elif pol_type == "circR":
+        px_re, px_im, py_re, py_im = np.full_like(phi, inv2), zeros, zeros, np.full_like(phi, inv2)
+    elif pol_type == "circL":
+        px_re, px_im, py_re, py_im = np.full_like(phi, inv2), zeros, zeros, np.full_like(phi, -inv2)
+    elif pol_type == "radial":
+        px_re, px_im, py_re, py_im = cos_p, zeros, sin_p, zeros
+    elif pol_type == "azimuthal":
+        # WARNING: azimuthal polarization yields a doughnut-shaped PSF (zero
+        # at center). The cleanup pipeline still runs, but the resulting
+        # defect is a ring — needs further validation before training use.
+        # Avoid this mode for now unless intentional.
+        px_re, px_im, py_re, py_im = -sin_p, zeros, cos_p, zeros
+    else:
+        raise ValueError(
+            f"Unknown pol_type: {pol_type!r}. Allowed: "
+            "linX, linY, lin45, circR, circL, radial, azimuthal."
+        )
+
+    # Richards-Wolf rotation matrix (aplanatic lens). Ayx = Axy by symmetry.
+    cos2p, sin2p, csp = cos_p * cos_p, sin_p * sin_p, cos_p * sin_p
+    Axx = cos_t * cos2p + sin2p
+    Axy = (cos_t - 1.0) * csp
+    Ayy = cos_t * sin2p + cos2p
+    Azx = -sin_t * cos_p
+    Azy = -sin_t * sin_p
+
+    ox_re = Axx * px_re + Axy * py_re
+    ox_im = Axx * px_im + Axy * py_im
+    oy_re = Axy * px_re + Ayy * py_re
+    oy_im = Axy * px_im + Ayy * py_im
+    oz_re = Azx * px_re + Azy * py_re
+    oz_im = Azx * px_im + Azy * py_im
+
+    e_re, e_im = np.cos(phase), np.sin(phase)
+    a = apod * mask
+    ux = a * (ox_re * e_re - ox_im * e_im) + 1j * a * (ox_re * e_im + ox_im * e_re)
+    uy = a * (oy_re * e_re - oy_im * e_im) + 1j * a * (oy_re * e_im + oy_im * e_re)
+    uz = a * (oz_re * e_re - oz_im * e_im) + 1j * a * (oz_re * e_im + oz_im * e_re)
+    return ux, uy, uz, mask
+
+
 def generate_one(cfg, rng):
     N = cfg["psf_size"]
     y, x = np.mgrid[-N//2:N//2, -N//2:N//2].astype(np.float64)
@@ -96,8 +165,17 @@ def generate_one(cfg, rng):
              + tri_x * rho2 * rho * np.cos(3*theta)
              + tri_y * rho2 * rho * np.sin(3*theta))
 
-    # PSF = |FFT(pupil)|^2
-    psf = np.abs(np.fft.fftshift(np.fft.fft2(mask * np.exp(1j * phase))))**2
+    # PSF: scalar (single FFT) or Richards-Wolf vector mode (3 FFTs)
+    if cfg.get("vector_mode", False):
+        na = sample(rng, cfg.get("na", 0.95))
+        pol_type = cfg.get("pol_type", "linX")
+        ux, uy, uz, mask = _build_vector_pupil(mask, phase, x, y, outer_r, na, pol_type)
+        Ix = np.abs(np.fft.fftshift(np.fft.fft2(ux))) ** 2
+        Iy = np.abs(np.fft.fftshift(np.fft.fft2(uy))) ** 2
+        Iz = np.abs(np.fft.fftshift(np.fft.fft2(uz))) ** 2
+        psf = Ix + Iy + Iz
+    else:
+        psf = np.abs(np.fft.fftshift(np.fft.fft2(mask * np.exp(1j * phase)))) ** 2
 
     # Brightness + background + noise
     psf = psf / psf.sum() * brightness + bg
