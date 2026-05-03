@@ -16,6 +16,7 @@ from scipy.ndimage import label
 
 PARAM_NAMES = [
     "outer_r", "epsilon", "ellipticity", "ellip_angle",
+    "square_eps", "h_stripe_w", "v_stripe_w", "h_outer_crop", "v_outer_crop",
     "defocus", "astig_x", "astig_y", "coma_x", "coma_y",
     "spherical", "trefoil_x", "trefoil_y",
     "brightness", "background", "gaussian_sigma",
@@ -45,6 +46,11 @@ def generate_one(cfg, rng):
     eps = sample(rng, cfg["epsilon"])
     ellip = sample(rng, cfg["ellipticity"])
     ellip_ang = sample(rng, cfg["ellip_angle"])
+    square_eps = sample(rng, cfg.get("square_eps", 0))
+    h_stripe_w = sample(rng, cfg.get("h_stripe_w", 0))
+    v_stripe_w = sample(rng, cfg.get("v_stripe_w", 0))
+    h_outer_crop = sample(rng, cfg.get("h_outer_crop", 0))
+    v_outer_crop = sample(rng, cfg.get("v_outer_crop", 0))
     defocus = sample(rng, cfg["defocus"])
     astig_x = sample(rng, cfg["astig_x"])
     astig_y = sample(rng, cfg["astig_y"])
@@ -63,6 +69,18 @@ def generate_one(cfg, rng):
     ry = (-x * sin_a + y * cos_a) / (1 - ellip)
     r = np.sqrt(rx**2 + ry**2)
     mask = ((r <= outer_r) & (r >= outer_r * eps)).astype(np.float64)
+
+    # Optional pupil obstructions (matches PSF Explorer web UI)
+    if square_eps > 0:
+        mask[(np.abs(x) <= outer_r * square_eps) & (np.abs(y) <= outer_r * square_eps)] = 0
+    if h_stripe_w > 0:
+        mask[np.abs(y) <= outer_r * h_stripe_w] = 0
+    if v_stripe_w > 0:
+        mask[np.abs(x) <= outer_r * v_stripe_w] = 0
+    if h_outer_crop > 0:
+        mask[np.abs(y) > outer_r * (1 - h_outer_crop)] = 0
+    if v_outer_crop > 0:
+        mask[np.abs(x) > outer_r * (1 - v_outer_crop)] = 0
 
     # Phase (Zernike)
     dx, dy = x / outer_r, y / outer_r
@@ -95,6 +113,7 @@ def generate_one(cfg, rng):
     cropped = psf[s:s+c, s:s+c]
 
     params = [outer_r, eps, ellip, ellip_ang,
+              square_eps, h_stripe_w, v_stripe_w, h_outer_crop, v_outer_crop,
               defocus, astig_x, astig_y, coma_x, coma_y, sph, tri_x, tri_y,
               brightness, bg, g_sig]
     return cropped, params
