@@ -314,7 +314,8 @@ def train_on_device(args):
         cache_size=args.cache_size,
         defect_mode=args.defect_mode,
         psf_config_paths=psf_config_paths,
-        psf_pool_size=args.psf_pool_size
+        psf_pool_size=args.psf_pool_size,
+        partial_leak_scale=tuple(args.partial_leak_scale),
     )
     
     dataloader = DataLoader(dataset, batch_size=args.bs, shuffle=True,
@@ -428,6 +429,10 @@ def main():
                         help='Number of DataLoader workers (default: 7)')
     parser.add_argument('--prefetch_factor', type=int, default=2,
                         help='Batches prefetched per worker (default: 2, increase for S3)')
+    parser.add_argument('--partial_leak_scale', type=float, nargs=2, default=[0.2, 0.7],
+                        metavar=('MIN', 'MAX'),
+                        help='Range of intensity scale when a target-only defect leaks to a ref '
+                             '(default: 0.2 0.7). The leak probability is fixed at 0.4 in dataloader.')
 
     args = parser.parse_args()
     

@@ -89,6 +89,16 @@ def calculate_positions(img_size, patch_size, min_patches=2):
         return positions.tolist()
 
 
+# Real captures sometimes show a defect at full intensity in target plus a
+# weakened version in ONE of the refs (slow defect formation, slight stage
+# drift between captures, etc.). Synthetic training mirrors this by leaking
+# target-only defects to one ref at reduced intensity, with mask still
+# labeling the defect — so the model learns to detect even when a ref is
+# partially contaminated.
+# The leak probability is fixed; the scale range is per-Dataset (CLI-tunable).
+PARTIAL_LEAK_PROB = 0.4
+
+
 def sample_magnitude(spec):
     """Sample defect intensity magnitude from a yaml spec.
 
@@ -156,13 +166,15 @@ class Dataset(Dataset):
                  img_format='tiff', cache_size=0,
                  defect_mode='gaussian', psf_config_paths=None,
                  psf_pool_size=1000,
-                 intensity_abs=(60, 80)):
+                 intensity_abs=(60, 80),
+                 partial_leak_scale=(0.2, 0.7)):
         self.patch_size = patch_size
         self.num_defects_range = num_defects_range
         self.img_format = img_format
         self.cache_size = cache_size
         self.defect_mode = defect_mode
         self.intensity_abs = intensity_abs
+        self.partial_leak_scale = partial_leak_scale
 
         if defect_mode == 'psf':
             if not psf_config_paths:
@@ -443,14 +455,32 @@ class Dataset(Dataset):
         remove_ref1 = target_only_ids | only_ref2_ids
         remove_ref2 = target_only_ids | only_ref1_ids
 
+        # Partial leak: each target-only defect may also appear at reduced
+        # intensity in one ref. Mask still labels it as a defect.
+        leak_to_ref1 = {}
+        leak_to_ref2 = {}
+        for tid in target_only_ids:
+            if np.random.rand() < PARTIAL_LEAK_PROB:
+                scale = np.random.uniform(*self.partial_leak_scale)
+                if np.random.rand() < 0.5:
+                    leak_to_ref1[tid] = scale
+                else:
+                    leak_to_ref2[tid] = scale
+
         gt_mask = np.zeros((h, w), dtype=np.float32)
 
         for i, (local_defect, bounds, intensity) in enumerate(defects):
             target = apply_local_defect_to_background(target, local_defect, bounds, intensity)
             if i not in remove_ref1:
                 ref1 = apply_local_defect_to_background(ref1, local_defect, bounds, intensity)
+            elif i in leak_to_ref1:
+                ref1 = apply_local_defect_to_background(
+                    ref1, local_defect, bounds, intensity * leak_to_ref1[i])
             if i not in remove_ref2:
                 ref2 = apply_local_defect_to_background(ref2, local_defect, bounds, intensity)
+            elif i in leak_to_ref2:
+                ref2 = apply_local_defect_to_background(
+                    ref2, local_defect, bounds, intensity * leak_to_ref2[i])
             if i in target_only_ids:
                 local_mask = create_binary_mask(local_defect, threshold=0.1)
                 y_start, y_end, x_start, x_end = bounds
