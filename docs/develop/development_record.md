@@ -393,6 +393,36 @@ bash inference_onnx_square.sh
 - ✅ **完整的 Square ONNX 匯出和推理功能**
 - ✅ **文件更新與 Git 提交**
 
+### 2026 年 5 月 5 日 — Sensor pixel sampling 與 intensity OOD 診斷
+
+**(1) Pixel sampling augmentation 整合（commit `4f6dcb1`）**
+- ✅ 新增 `pixel_oversample` yaml 參數，預設 1（向後相容）
+- ✅ `generate_psf.py` 加入 oversample-shift-bin 流程：FFT 在 (psf_size × oversample) fine grid，再 sum factor² fine cells per sensor pixel，random sub-pixel offset
+- ✅ Noise / background 改在 bin 後加（之前在 fine grid 加會讓 Gaussian σ 放大 factor 倍）
+- ✅ PSF Explorer (`psf-explorer-app/src/App.jsx`) 加入互動 toggle + 倍率 + sub-pixel shift sliders
+- ✅ `utils/oversample_demo.py` 驗證能量守恆與 peak-split 現象
+
+**(2) Bright_spots false positive 根因診斷**
+
+問題：訓練好的 model 在 test 254 (940, 46) 等位置 fire heatmap ~1.0，但這些位置的 pattern 是 `T-R1=±80, T-R2=0`（其中一個 ref 完全同步），按 contrastive 語意應該是背景而非缺陷。
+
+排查過程：
+- ❌ **partial_leak 不是元兇**：把 leak 完全關掉重訓，false positive 沒有改善（反而 0.9944 → 1.0000）。對照 4 個 probe 位置確認
+- ❌ **Dataloader label 沒問題**：抽 30 個 patch 掃描，108 個 only_ref2-pattern pixel 全部標 mask=0，95 個 target_only-pattern pixel 全部標 mask=1
+- ✅ **Intensity train/test mismatch 才是元兇**：用合成 patch 對 model 做 intensity sweep（10 / 20 / 40 / 80），發現 model 只在訓練分布內（intensity=10）能區分 target_only vs only_ref2（0.97 vs 0.54），intensity ≥ 20 三種 pattern 一律 fire ~1.0
+  - `type4_vector.yaml` 的 `intensity_abs: [8, 12]`
+  - 但實機 test 資料 \|T-R1\| 達 80（10× 訓練分布）
+  - Model 在 OOD intensity 下 contrastive logic 失效，shortcut「強訊號 → fire」接管
+
+**(3) 修復**
+- ✅ `intensity_abs: [8, 12]` → `[[8, 12], [60, 90]]`（mixture 形式涵蓋弱+強兩個 mode）
+- ✅ 重訓後 (940, 46) heatmap 從 0.9944 降到 **0.0496**（−95 pp），target_only recall 維持 0.999
+- ✅ Intensity sweep 在 inten=80 下 only_ref2/only_ref1 都壓到 < 0.05，contrastive logic 在所有 intensity 範圍重新建立
+
+**經驗**：
+- yaml 的 `intensity_abs` 必須對齊真實 sensor 看到的訊號強度範圍，否則弱訓練→強測試會直接觸發 OOD shortcut
+- 排查順序：先驗 dataloader label 對不對 → 再驗訓練分布有沒有覆蓋測試 → 最後才考慮 augmentation 機制（partial_leak 等）
+
 ---
 
 ## 專案檔案結構
