@@ -38,6 +38,25 @@ def sample(rng, r):
     return r
 
 
+def _bin_down(arr, factor, offset_y, offset_x):
+    """Sum factor×factor fine cells per sensor pixel, with sub-pixel offset.
+
+    Models sensor pixel area integration: each sensor pixel reads the integral
+    of the continuous light field over its area. Random offset ∈ [0, factor)²
+    controls where the PSF center lands relative to the sensor pixel grid.
+
+    Energy is conserved (np.roll wraps; PSF tail values at boundaries are
+    negligible compared to peak).
+    """
+    if factor == 1:
+        return arr
+    NB = arr.shape[0] // factor
+    oy = int(offset_y) % factor
+    ox = int(offset_x) % factor
+    rolled = np.roll(arr, shift=(-oy, -ox), axis=(0, 1))
+    return rolled.reshape(NB, factor, NB, factor).sum(axis=(1, 3))
+
+
 def _build_vector_pupil(mask, phase, x, y, outer_r, na, pol_type):
     """Build Richards-Wolf vector pupil components (Ux, Uy, Uz).
 
@@ -108,7 +127,13 @@ def _build_vector_pupil(mask, phase, x, y, outer_r, na, pol_type):
 
 
 def generate_one(cfg, rng):
-    N = cfg["psf_size"]
+    # pixel_oversample controls sensor sampling. 1 = original behavior (FFT
+    # on psf_size grid). >1 runs FFT on (psf_size × oversample) fine grid
+    # then sums oversample² fine cells per sensor pixel with a random
+    # sub-pixel offset, modeling finite-pixel-grid integration.
+    oversample = int(cfg.get("pixel_oversample", 1))
+    N_sensor = cfg["psf_size"]
+    N = N_sensor * oversample
     y, x = np.mgrid[-N//2:N//2, -N//2:N//2].astype(np.float64)
 
     outer_r = sample(rng, cfg["outer_r"])
@@ -177,7 +202,17 @@ def generate_one(cfg, rng):
     else:
         psf = np.abs(np.fft.fftshift(np.fft.fft2(mask * np.exp(1j * phase)))) ** 2
 
-    # Brightness + background + noise
+    # Sensor sampling: bin fine grid → sensor grid with random sub-pixel offset.
+    # Skipped when oversample=1 (psf is already on sensor grid).
+    if oversample > 1:
+        oy = int(rng.integers(0, oversample))
+        ox = int(rng.integers(0, oversample))
+        psf = _bin_down(psf, oversample, oy, ox)
+
+    # Brightness + background + noise — on sensor grid (post-bin).
+    # Order matters: bg is per-sensor-pixel dark current, Gaussian σ is
+    # per-sensor-pixel read noise. Doing these on a fine grid then summing
+    # would scale σ by factor (physically wrong).
     psf = psf / psf.sum() * brightness + bg
     if cfg.get("poisson_noise", True):
         psf = rng.poisson(np.maximum(0, psf)).astype(np.float64)
@@ -185,9 +220,9 @@ def generate_one(cfg, rng):
         psf += rng.normal(0, g_sig, psf.shape)
     psf = np.maximum(0, psf)
 
-    # Center crop
+    # Center crop on sensor grid
     c = cfg["crop_size"]
-    s = N // 2 - c // 2
+    s = N_sensor // 2 - c // 2
     cropped = psf[s:s+c, s:s+c]
 
     params = [outer_r, eps, ellip, ellip_ang,

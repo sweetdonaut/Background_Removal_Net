@@ -117,6 +117,45 @@ function renderCropped(ctx, data, N, zoom, useLog) {
   ctx.imageSmoothingEnabled = false; ctx.drawImage(tmp, 0, 0, N, N);
 }
 
+/* ═══════════════════ PIXEL SAMPLING ═══════════════════
+ * binDown: sum factor×factor blocks back to coarse grid. Wraps around for the
+ * shift offset so total energy is preserved (no boundary trim).
+ * strideDown: cheap nearest-neighbor downsample for previews (mask/phase).
+ */
+function binDown(data, N, factor, offY, offX) {
+  if (factor === 1) return data;
+  const NB = N / factor;
+  const out = new Float64Array(NB * NB);
+  const oy = ((offY % factor) + factor) % factor;
+  const ox = ((offX % factor) + factor) % factor;
+  for (let y = 0; y < NB; y++) {
+    for (let x = 0; x < NB; x++) {
+      let s = 0;
+      for (let dy = 0; dy < factor; dy++) {
+        for (let dx = 0; dx < factor; dx++) {
+          const sy = (y * factor + dy + oy) % N;
+          const sx = (x * factor + dx + ox) % N;
+          s += data[sy * N + sx];
+        }
+      }
+      out[y * NB + x] = s;
+    }
+  }
+  return out;
+}
+function strideDown(data, N, NB) {
+  if (N === NB) return data;
+  const stride = N / NB;
+  const out = new Float64Array(NB * NB);
+  for (let y = 0; y < NB; y++) {
+    const sy = Math.floor(y * stride);
+    for (let x = 0; x < NB; x++) {
+      out[y * NB + x] = data[sy * N + Math.floor(x * stride)];
+    }
+  }
+  return out;
+}
+
 /* ═══════════════════ UI ═══════════════════ */
 function Slider({label, sub, value, min, max, step, onChange}) {
   return (<div style={{marginBottom:12}}>
@@ -144,8 +183,7 @@ function Section({title, sub, children, open: initOpen = true, color = "#aaa"}) 
 }
 
 /* ═══════════════════ MAIN ═══════════════════ */
-const N = 256;
-const S = N * N;
+const N_BASE = 256;
 
 export default function PSFExplorer() {
   // Aperture
@@ -181,6 +219,15 @@ export default function PSFExplorer() {
   const [gaussNoise, setGaussNoise] = useState(1.5);
   const [noiseSeed, setNoiseSeed] = useState(42);
 
+  // Pixel sampling — simulate sensor-grid sampling of a continuous PSF.
+  // factor=1 (default) keeps current behavior. factor>1 oversamples on a
+  // factor×N_BASE grid then bins back, with sub-pixel shift controlling
+  // where the PSF center lands relative to the final pixel grid.
+  const [enableSampling, setEnableSampling] = useState(false);
+  const [oversampleFactor, setOversampleFactor] = useState(2);
+  const [sampleShiftX, setSampleShiftX] = useState(0);
+  const [sampleShiftY, setSampleShiftY] = useState(0);
+
   // Display
   const [useLog, setUseLog] = useState(false);
   const [zoom, setZoom] = useState(4);
@@ -193,6 +240,12 @@ export default function PSFExplorer() {
   const ezRef = useRef(null);
 
   const compute = useCallback(() => {
+    // factor=1 reproduces the original behavior. factor>1 runs the full FFT
+    // pipeline on a factor×N_BASE grid and bins back to N_BASE — the bin sum
+    // is the physical "pixel integration" a real sensor performs.
+    const factor = enableSampling ? oversampleFactor : 1;
+    const N = N_BASE * factor;
+    const S = N * N;
     const cx = N / 2, cy = N / 2;
     const innerR = outerR * epsilon;
 
@@ -229,11 +282,13 @@ export default function PSFExplorer() {
       phase[y * N + x] = p;
     }
 
-    // ── Render aperture & phase ──
+    // ── Render aperture & phase (downsample to N_BASE for the 256×256 canvas) ──
     const apCtx = apertureRef.current?.getContext("2d");
     const phCtx = phaseRef.current?.getContext("2d");
-    if (apCtx) renderMask(apCtx, mask, N);
-    if (phCtx) renderPhase(phCtx, phase, mask, N);
+    const dispMask = strideDown(mask, N, N_BASE);
+    const dispPhase = strideDown(phase, N, N_BASE);
+    if (apCtx) renderMask(apCtx, dispMask, N_BASE);
+    if (phCtx) renderPhase(phCtx, dispPhase, dispMask, N_BASE);
 
     let shifted;
 
@@ -339,35 +394,43 @@ export default function PSFExplorer() {
       const shiftIx = fftShift(Ix, N), shiftIy = fftShift(Iy, N), shiftIz = fftShift(Iz, N);
       shifted = fftShift(total, N);
 
-      // Render component canvases
+      // Render component canvases (downsample to N_BASE for display)
       const exCtx = exRef.current?.getContext("2d");
       const eyCtx = eyRef.current?.getContext("2d");
       const ezCtx = ezRef.current?.getContext("2d");
-      if (exCtx) renderCropped(exCtx, shiftIx, N, zoom, useLog);
-      if (eyCtx) renderCropped(eyCtx, shiftIy, N, zoom, useLog);
-      if (ezCtx) renderCropped(ezCtx, shiftIz, N, zoom, useLog);
+      if (exCtx) renderCropped(exCtx, strideDown(shiftIx, N, N_BASE), N_BASE, zoom, useLog);
+      if (eyCtx) renderCropped(eyCtx, strideDown(shiftIy, N, N_BASE), N_BASE, zoom, useLog);
+      if (ezCtx) renderCropped(ezCtx, strideDown(shiftIz, N, N_BASE), N_BASE, zoom, useLog);
     }
 
-    // ── Noise ──
+    // ── Sensor sampling: bin oversampled fine grid back to N_BASE ──
+    // sub-pixel shift offset (in fine cells) controls where the PSF center
+    // sits relative to the sensor's pixel grid. offset=0 → peak centered on a
+    // pixel; offset=factor/2 → peak straddles two pixels (the "split" effect).
+    const sensor = binDown(shifted, N, factor, sampleShiftY, sampleShiftX);
+    const NB_S = N_BASE * N_BASE;
+
+    // ── Noise on sensor pixels (post-bin) ──
     let sum = 0;
-    for (let i = 0; i < S; i++) sum += shifted[i];
+    for (let i = 0; i < NB_S; i++) sum += sensor[i];
     const scale = sum > 0 ? brightness / sum : 1;
-    const final_ = new Float64Array(S);
+    const final_ = new Float64Array(NB_S);
     const rng = mulberry32(noiseSeed);
     const gauss = boxMullerRng(rng);
-    for (let i = 0; i < S; i++) {
-      let v = shifted[i] * scale + background;
+    for (let i = 0; i < NB_S; i++) {
+      let v = sensor[i] * scale + background;
       if (poissonOn) v = poissonSample(Math.max(0, v), rng);
       if (gaussNoise > 0) v += gauss() * gaussNoise;
       final_[i] = Math.max(0, v);
     }
 
     const psCtx = psfRef.current?.getContext("2d");
-    if (psCtx) renderCropped(psCtx, final_, N, zoom, useLog);
+    if (psCtx) renderCropped(psCtx, final_, N_BASE, zoom, useLog);
   }, [outerR, epsilon, squareEps, ellipticity, ellipAngle, hStripeW, vStripeW, hOuterCrop, vOuterCrop,
       vectorMode, na, polType,
       defocus, astigX, astigY, comaX, comaY, spherical, trefoilX, trefoilY,
-      brightness, background, poissonOn, gaussNoise, noiseSeed, useLog, zoom]);
+      brightness, background, poissonOn, gaussNoise, noiseSeed, useLog, zoom,
+      enableSampling, oversampleFactor, sampleShiftX, sampleShiftY]);
 
   useEffect(() => { compute(); }, [compute]);
 
@@ -380,6 +443,7 @@ export default function PSFExplorer() {
     setDefocus(0); setAstigX(0); setAstigY(0); setComaX(0); setComaY(0);
     setSpherical(0); setTrefoilX(0); setTrefoilY(0);
     setBrightness(5000); setBackground(5); setPoissonOn(false); setGaussNoise(1.5); setNoiseSeed(42);
+    setEnableSampling(false); setOversampleFactor(2); setSampleShiftX(0); setSampleShiftY(0);
   };
 
   const polLabels = {
@@ -501,6 +565,56 @@ export default function PSFExplorer() {
               color: "#34d399", fontSize: 10.5, padding: "4px 12px", borderRadius: 6, cursor: "pointer", fontFamily: "inherit", marginTop: 4,
             }}>🎲 重新取樣雜訊</button>
           </Section>
+
+          {/* Pixel sampling */}
+          <Section title="像素取樣" sub="Pixel Sampling" open={false} color="#fb923c">
+            <div style={{
+              marginBottom: 12, padding: "10px 12px", borderRadius: 8,
+              background: enableSampling ? "rgba(251,146,60,0.08)" : "rgba(255,255,255,0.02)",
+              border: `1px solid ${enableSampling ? "rgba(251,146,60,0.2)" : "rgba(255,255,255,0.06)"}`,
+            }}>
+              <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer" }}>
+                <input type="checkbox" checked={enableSampling} onChange={e => setEnableSampling(e.target.checked)}
+                  style={{ accentColor: "#fb923c", width: 16, height: 16 }} />
+                <div>
+                  <div style={{ color: "#e0e0e0", fontSize: 12.5, fontWeight: 600 }}>啟用像素取樣模擬</div>
+                  <div style={{ color: "#666", fontSize: 10 }}>感測器將連續 PSF 切割成像素方格</div>
+                </div>
+              </label>
+            </div>
+            {enableSampling && (
+              <>
+                <div style={{ marginBottom: 12 }}>
+                  <div style={{ color: "#e0e0e0", fontSize: 12, fontWeight: 600, marginBottom: 6 }}>
+                    取樣倍率 <span style={{ color: "#555", fontSize: 10.5, marginLeft: 4 }}>oversample factor</span>
+                  </div>
+                  <div style={{ display: "flex", gap: 4 }}>
+                    {[2, 4, 8].map(f => (
+                      <button key={f} onClick={() => {
+                        setOversampleFactor(f);
+                        if (sampleShiftX >= f) setSampleShiftX(0);
+                        if (sampleShiftY >= f) setSampleShiftY(0);
+                      }} style={{
+                        flex: 1,
+                        background: oversampleFactor === f ? "rgba(251,146,60,0.2)" : "rgba(255,255,255,0.04)",
+                        border: `1px solid ${oversampleFactor === f ? "rgba(251,146,60,0.45)" : "rgba(255,255,255,0.08)"}`,
+                        color: oversampleFactor === f ? "#fb923c" : "#888",
+                        fontSize: 11, padding: "5px 0", borderRadius: 5, cursor: "pointer", fontFamily: "inherit",
+                      }}>{f}×</button>
+                    ))}
+                  </div>
+                </div>
+                <Slider label="次像素位移 X" sub={`0 → ${oversampleFactor - 1}`} value={sampleShiftX}
+                  min={0} max={Math.max(0, oversampleFactor - 1)} step={1} onChange={v => setSampleShiftX(Math.round(v))} />
+                <Slider label="次像素位移 Y" sub={`0 → ${oversampleFactor - 1}`} value={sampleShiftY}
+                  min={0} max={Math.max(0, oversampleFactor - 1)} step={1} onChange={v => setSampleShiftY(Math.round(v))} />
+                <div style={{ marginTop: 8, fontSize: 10.5, color: "#888", lineHeight: 1.5 }}>
+                  位移 = 0 → peak 對齊在像素中心；位移 = factor/2 → peak 落在像素邊界
+                  （能量被切到相鄰像素，apparent peak 下降）。倍率 8× 時 FFT 變 64× 計算量，可能會卡。
+                </div>
+              </>
+            )}
+          </Section>
         </div>
 
         {/* ═══ VISUALIZATIONS ═══ */}
@@ -510,7 +624,7 @@ export default function PSFExplorer() {
             <div style={{ flex: 1 }}>
               <div style={{ background: "rgba(255,255,255,0.03)", borderRadius: 10, border: "1px solid rgba(255,255,255,0.06)", padding: 8, textAlign: "center" }}>
                 <div style={{ fontSize: 10.5, color: "#666", marginBottom: 5, fontWeight: 500 }}>光圈形狀 Aperture</div>
-                <canvas ref={apertureRef} width={N} height={N} style={{ width: "100%", aspectRatio: "1", borderRadius: 6, imageRendering: "pixelated" }} />
+                <canvas ref={apertureRef} width={N_BASE} height={N_BASE} style={{ width: "100%", aspectRatio: "1", borderRadius: 6, imageRendering: "pixelated" }} />
               </div>
             </div>
             <div style={{ flex: 1 }}>
@@ -518,7 +632,7 @@ export default function PSFExplorer() {
                 <div style={{ fontSize: 10.5, color: "#666", marginBottom: 5, fontWeight: 500 }}>
                   相位圖 Phase {hasAberrations ? "" : "(無像差)"}
                 </div>
-                <canvas ref={phaseRef} width={N} height={N} style={{ width: "100%", aspectRatio: "1", borderRadius: 6, imageRendering: "pixelated" }} />
+                <canvas ref={phaseRef} width={N_BASE} height={N_BASE} style={{ width: "100%", aspectRatio: "1", borderRadius: 6, imageRendering: "pixelated" }} />
               </div>
             </div>
           </div>
@@ -534,7 +648,7 @@ export default function PSFExplorer() {
                 <div key={label} style={{ flex: 1 }}>
                   <div style={{ background: "rgba(255,255,255,0.03)", borderRadius: 8, border: "1px solid rgba(255,255,255,0.06)", padding: 6, textAlign: "center" }}>
                     <div style={{ fontSize: 10, color, marginBottom: 4, fontWeight: 600 }}>{label}</div>
-                    <canvas ref={ref} width={N} height={N} style={{ width: "100%", aspectRatio: "1", borderRadius: 4, imageRendering: "pixelated" }} />
+                    <canvas ref={ref} width={N_BASE} height={N_BASE} style={{ width: "100%", aspectRatio: "1", borderRadius: 4, imageRendering: "pixelated" }} />
                   </div>
                 </div>
               ))}
@@ -563,7 +677,7 @@ export default function PSFExplorer() {
                 </select>
               </div>
             </div>
-            <canvas ref={psfRef} width={N} height={N} style={{ width: "100%", aspectRatio: "1", borderRadius: 6, imageRendering: "pixelated" }} />
+            <canvas ref={psfRef} width={N_BASE} height={N_BASE} style={{ width: "100%", aspectRatio: "1", borderRadius: 6, imageRendering: "pixelated" }} />
           </div>
 
           {/* Tips */}
