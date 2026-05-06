@@ -48,7 +48,7 @@ trefoil_y: [0, 0]
 
 # Defect intensity magnitude (sign is randomly +/-).
 # Forms: scalar, [a, b], or [[a1,b1], [a2,b2], ...] (equal-prob mixture)
-intensity_abs: [[8, 12], [60, 90]]
+intensity_abs: [[8, 12]]
 
 # Noise
 brightness: [5000, 5000]
