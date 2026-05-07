@@ -217,23 +217,66 @@ def print_rank_distribution(sorted_trials, rank_table):
         print(f'{t["name"]:{name_w}}  {cells}  {mean_str}')
 
 
+def print_single_yaml_breakdown(sorted_trials, rank_table):
+    """Per-defect tier breakdown for leaderboard #1 trial alone.
+
+    Answers: 'if I deploy ONE yaml in production, what does the per-defect
+    review experience look like?' — distinct from the cross-trial oracle
+    view in print_best_yaml_per_defect.
+    """
+    best_trial = sorted_trials[0]
+    name = best_trial['name']
+    metric = best_trial['main_metric']
+    defect_ids = list(rank_table.keys())
+
+    print(f'\n=== Single best yaml: {name}  '
+          f'(leaderboard #1, {metric}={best_trial["best_metric"]:.3f}) ===')
+    print(f'  {best_trial["overrides"]}')
+
+    groups = [
+        ('Strong  (rank<=30) ', lambda r: r is not None and r <= 30),
+        ('Mid     (31-50)    ', lambda r: r is not None and 30 < r <= 50),
+        ('Weak    (51-150)   ', lambda r: r is not None and 50 < r <= 150),
+        ('Missed  (no match) ', lambda r: r is None),
+    ]
+    for label, pred in groups:
+        members = sorted(
+            [(d, rank_table[d][name]) for d in defect_ids
+             if pred(rank_table[d][name])],
+            key=lambda x: x[1] if x[1] is not None else 9999)
+        print(f'    {label}: {len(members)}')
+        if not members:
+            continue
+        items = [(f'{d}(r{r})' if r is not None else f'{d}(miss)')
+                 for d, r in members]
+        for i in range(0, len(items), 4):
+            print(f'      {", ".join(items[i:i+4])}')
+
+
 def print_best_yaml_per_defect(sorted_trials):
+    """Cross-trial oracle view: for each defect, which trial gives the lowest
+    global_rank (i.e. surfaces it earliest in the cross-image candidate list).
+
+    This is the upper-bound 'if I knew which yaml to use per defect' view —
+    pair it with print_single_yaml_breakdown for the realistic single-deploy
+    counterpart.
+    """
     if not sorted_trials or sorted_trials[0]['best_record'] is None:
         return
     defect_ids = sorted(sorted_trials[0]['best_record']['per_defect'].keys())
-    print('\n=== Best yaml per defect (highest matched score) ===')
+    print('\n=== Best yaml per defect (cross-trial oracle, by lowest rank) ===')
     for d in defect_ids:
         best = None
         for t in sorted_trials:
             info = _match_info(t['best_record']['per_defect'].get(d))
             if info is None:
                 continue
-            if best is None or info['score'] > best['score']:
+            if best is None or info['global_rank'] < best['global_rank']:
                 best = {**info, 'trial': t['name'], 'overrides': t['overrides']}
         if best:
-            print(f'  {d}: {best["trial"]}  score={best["score"]:.3f}  '
-                  f'local={best["local_rank"]}  '
-                  f'overall={best["global_rank"]:>3d}/{best["n_total"]}  '
+            print(f'  {d}: {best["trial"]}  '
+                  f'rank={best["global_rank"]:>3d}/{best["n_total"]}  '
+                  f'(local={best["local_rank"]}, score={best["score"]:.3f})  '
                   f'{best["overrides"]}')
         else:
             print(f'  {d}: not matched in any trial')
@@ -555,6 +598,7 @@ def main():
     print_rank_matrix(sorted_trials, rank_table)
     print_difficulty_buckets(sorted_trials, rank_table)
     print_rank_distribution(sorted_trials, rank_table)
+    print_single_yaml_breakdown(sorted_trials, rank_table)
     print_best_yaml_per_defect(sorted_trials)
     chosen = quality_weighted_greedy(
         sorted_trials, rank_table, k=args.ensemble_k)
