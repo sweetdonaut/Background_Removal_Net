@@ -199,34 +199,52 @@ def cross_image_metrics(per_image, match_radius=3.0, top_k_list=(30, 50, 150)):
 def per_defect_summary(per_image):
     """Flatten per_image list into a defect-id keyed dict for jsonl logging.
 
-    Each value: {matched, local_rank, score, dist}.
-        matched    : True if a detection lies within match_radius of GT
-        local_rank : index in this image's detection list (0 = top), else None
-        score      : matched detection's score, else top FP score (best fail)
-        dist       : pixel distance from matched detection to GT, else None
+    Each value: {matched_idx, n_total, candidates}.
+        matched_idx : index into candidates whose detection lies within
+                      match_radius of GT; None if no candidate matched.
+        n_total     : total detections across all images (denominator for
+                      candidate.global_rank).
+        candidates  : list of dicts (one per detection from this image's pipeline,
+                      same order as detect_in_image output, top-first):
+            score       : detection score (top-K mean within score_window)
+            global_rank : 1-based position in cross-image score-sorted detections
+            dist_to_gt  : pixel distance from this candidate to GT
+
+    Candidates and the match outcome are independent: every image always has
+    candidates regardless of whether any of them hit the GT. This makes
+    near-miss / nuisance / score-gap analysis straightforward.
     """
+    all_dets = []
+    for entry in per_image:
+        img_id = entry['image_id']
+        for det_idx, (_, _, score) in enumerate(entry['detections']):
+            all_dets.append((score, img_id, det_idx))
+    all_dets.sort(key=lambda d: -d[0])
+    rank_lookup = {(img_id, idx): r + 1
+                   for r, (_, img_id, idx) in enumerate(all_dets)}
+    n_total = len(all_dets)
+
     out = {}
     for entry in per_image:
         defect_id = entry['image_id'].split('#')[0]
         gt_x, gt_y = entry['gt']
-        rank = entry['gt_local_rank']
-        if rank is not None:
-            dy, dx, score = entry['detections'][rank]
+        img_id = entry['image_id']
+
+        candidates = []
+        for det_idx, (dy, dx, score) in enumerate(entry['detections']):
             dist = float(((dx - gt_x) ** 2 + (dy - gt_y) ** 2) ** 0.5)
-            out[defect_id] = {
-                'matched': True,
-                'local_rank': int(rank),
+            candidates.append({
                 'score': float(score),
-                'dist': dist,
-            }
-        else:
-            top_score = entry['detections'][0][2] if entry['detections'] else 0.0
-            out[defect_id] = {
-                'matched': False,
-                'local_rank': None,
-                'score': float(top_score),
-                'dist': None,
-            }
+                'global_rank': rank_lookup[(img_id, det_idx)],
+                'dist_to_gt': round(dist, 2),
+            })
+
+        matched_idx = entry['gt_local_rank']
+        out[defect_id] = {
+            'matched_idx': int(matched_idx) if matched_idx is not None else None,
+            'n_total': n_total,
+            'candidates': candidates,
+        }
     return out
 
 
