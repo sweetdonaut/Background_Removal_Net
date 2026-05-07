@@ -1,0 +1,35 @@
+# Optical-aberrations search — target the deep-nuisance defects that
+# intensity-only searches couldn't fix (DefectID028/012/011/015 in v3).
+# Hypothesis: those defects' PSF shape diverges enough from the default
+# vector mode that varying Zernike aberrations during training will help
+# the model generalise.
+#
+# 4 dims (single-axis representatives) to keep the 50-trial budget effective:
+#   - defocus       : the most universal aberration in real captures
+#   - spherical     : surface-curvature mismatch
+#   - astig_x       : astigmatism (one axis suffices for sensitivity sweep)
+#   - coma_x        : off-axis aberration (one axis suffices)
+
+description: "Optical aberrations (Zernike) — target deep-nuisance defects"
+base_yaml: src_core/defects/type4_vector.yaml
+
+dims:
+  defocus:
+    type: scalar_pair
+    range: {min: -1.5, max: 1.5}
+    decimals: 2
+
+  spherical:
+    type: scalar_pair
+    range: {min: -0.8, max: 0.8}
+    decimals: 2
+
+  astig_x:
+    type: scalar_pair
+    range: {min: -1.0, max: 1.0}
+    decimals: 2
+
+  coma_x:
+    type: scalar_pair
+    range: {min: -0.8, max: 0.8}
+    decimals: 2

@@ -1,14 +1,16 @@
 # Yaml Search SOP
 
-整個流程你只會用到 **2 個指令** + **編輯 1 個檔案**：
+整個流程你只會用到 **2 個指令** + **編輯 1 個 yaml**：
 
 ```
 bash src_search/submit_search.sh ...      ← 觸發搜尋（會跑很多 trial）
 python src_search/analyze_results.py ...  ← 看結果
-src_search/search_space.py                ← 編輯這個來換要搜的參數
+src_search/search_configs/*.yaml                     ← 編輯（或新增）spec 來換要搜的參數
 ```
 
 > **重要：所有指令都要從 project root（`Background_Removal_Net/`）執行。** 不要 `cd src_search` 再跑，否則相對路徑會找不到資料。
+
+> **多 GPU 並行**：每次 run 自帶獨立 spec yaml，**兩張 GPU 跑不同 spec 不會互相影響**。Spec 是 per-run input data，不再是全域 source code。
 
 ---
 
@@ -28,7 +30,10 @@ DefectID???#X,Y.tiff       ← X, Y 是 PSF 中心座標
 ```bash
 REAL_VALID_DIR=/abs/path/to/real_30ea \
 TRAINING_DATASET_PATH=/abs/path/to/production/clean/good/ \
-bash src_search/submit_search.sh checkpoints/search_v1 50 20 1000
+bash src_search/submit_search.sh \
+    --spec src_search/search_configs/intensity.yaml \
+    --output_root checkpoints/intensity_v1 \
+    --n_trials 50 --epochs 20 --pool 1000
 ```
 
 **方式 B — 編輯 submit_search.sh 改 default**
@@ -46,14 +51,11 @@ TRAINING_DATASET_PATH=${TRAINING_DATASET_PATH:-data/grid_stripe_4channel/train/g
 門檻太嚴會讓「差一點點」算 miss、metric 會抖、trial 排名被噪音干擾。
 
 ```bash
-# 預設 3.0 px（跟之前行為一致）
-bash src_search/submit_search.sh ...
+# 預設 3.0 px
+bash src_search/submit_search.sh --spec ... --output_root ...
 
 # Production 機台 peak 漂得比較遠 → 放寬到 5
-MATCH_RADIUS=5 bash src_search/submit_search.sh checkpoints/search_v2 50 20 1000
-
-# 跟 dead pixel / 路徑可以同時組合
-DEAD_PIXEL_CSV=/path/csv MATCH_RADIUS=5 bash src_search/submit_search.sh ...
+MATCH_RADIUS=5 bash src_search/submit_search.sh --spec ... --output_root ...
 ```
 
 ### Dead pixel mask（CCD 永久亮點）
@@ -79,31 +81,55 @@ dead_x,dead_y
 ## Step 2 — 跑搜尋
 
 ```bash
-bash src_search/submit_search.sh  <output_root>  <n_trials>  <epochs>  <psf_pool_size>
+bash src_search/submit_search.sh \
+    --spec <path/to/spec.yaml> \
+    --output_root <checkpoints/your_run> \
+    [--n_trials N] [--epochs N] [--pool N]
 ```
 
 **範例**：
 ```bash
-bash src_search/submit_search.sh checkpoints/search_v1 50 20 1000
+bash src_search/submit_search.sh \
+    --spec src_search/search_configs/intensity.yaml \
+    --output_root checkpoints/intensity_v1 \
+    --n_trials 50 --epochs 20 --pool 1000
 ```
 
-四個位置參數：
+**多 GPU 並行**：兩張 GPU 同時跑不同 spec，互不干擾：
+```bash
+# Terminal 1
+CUDA_VISIBLE_DEVICES=0 bash src_search/submit_search.sh \
+    --spec src_search/search_configs/intensity.yaml \
+    --output_root checkpoints/intensity_v1 \
+    --n_trials 50 --epochs 20 --pool 1000
 
-| 位置 | 意義 | 建議值 |
-|---|---|---|
-| 1 | output 根目錄 | 每次新實驗換新名（避免覆蓋） |
-| 2 | trial 數量 | 50 起跳；用環境變數測試時可用 5 |
-| 3 | 每 trial 的 epoch 數 | production 用 20，smoke test 用 5 |
-| 4 | 每 trial 預生 PSF 數 | production 用 1000，smoke test 用 200 |
-
-每個 trial 結束會在 `<output_root>/trial_NNN/` 產生：
+# Terminal 2
+CUDA_VISIBLE_DEVICES=1 bash src_search/submit_search.sh \
+    --spec src_search/search_configs/optical.yaml \
+    --output_root checkpoints/optical_v1 \
+    --n_trials 50 --epochs 20 --pool 1000
 ```
-trial_yaml.yaml      ← 這個 trial 採樣的 yaml
-params.json          ← 採樣的 override 純值
-epoch_log.jsonl      ← 每 epoch 的 metrics + 30 顆 per-defect 訊號
-summary.json         ← final best metric + history
-*_best.pth           ← best checkpoint
-trial.log            ← 完整 stdout
+
+### Flag 說明
+
+| Flag | 必填 | 意義 | 建議值 |
+|---|---|---|---|
+| `--spec` | ✓ | search spec yaml 路徑 | 指向 `src_search/search_configs/*.yaml` |
+| `--output_root` | ✓ | output 根目錄 | 每次新實驗換新名（避免覆蓋）|
+| `--n_trials` | | trial 數量 | 50 起跳；smoke test 用 5 |
+| `--epochs` | | 每 trial 的 epoch 數 | production 20，smoke test 5 |
+| `--pool` | | 每 trial 預生 PSF 數 | production 1000，smoke test 200 |
+
+每次執行會在 `<output_root>/` 產生：
+```
+search_spec.yaml         ← 整批共用，spec snapshot（保留實驗意圖）
+trial_NNN/
+  trial_yaml.yaml        ← base_yaml + 這個 trial 抽到的 override 合成的完整 yaml
+  params.json            ← 抽到的 override 純值 + 來源 spec 路徑
+  epoch_log.jsonl        ← 每 epoch 的 metrics + 30 顆 per-defect 訊號
+  summary.json           ← final best metric + history
+  *_best.pth             ← best checkpoint
+  trial.log              ← 完整 stdout
 ```
 
 ---
@@ -113,7 +139,7 @@ trial.log            ← 完整 stdout
 **任何時候**都可以跑（包括搜尋還在跑的時候）。會自動 skip 還沒完成的 trial：
 
 ```bash
-python src_search/analyze_results.py --output_root checkpoints/search_v1
+python src_search/analyze_results.py --output_root checkpoints/intensity_v1
 ```
 
 會印 4 個區塊：
@@ -126,78 +152,89 @@ python src_search/analyze_results.py --output_root checkpoints/search_v1
 
 ## Step 4 — 換要實驗的參數
 
-`src_search/search_space.py` 已經把 16 個常用 yaml key 的採樣函式都實作好了。**你只要 toggle (uncomment / comment) `sample_params()` 裡的對應行**，其他檔案完全不必動。
+新流程：spec yaml = 一次搜尋的「實驗意圖」。要換實驗就**複製 / 編輯 spec yaml**。
+以下是已準備好的兩個檔案：
 
-### 目前狀態（只搜 intensity_abs）
-
-```python
-def sample_params(rng):
-    out = {}
-    out['intensity_abs'] = sample_intensity_abs(rng)
-    # out['outer_r'] = sample_outer_r(rng)
-    # out['brightness'] = sample_brightness(rng)
-    # ...
-    return out
+```
+src_search/search_configs/_template.yaml   ← 列出所有可搜 dim（全部 comment 起來）
+src_search/search_configs/intensity.yaml   ← 一個 working example
 ```
 
-### 換實驗：只要 uncomment 你要搜的那行
+### Spec 檔結構
 
-**範例 A — 改成搜光圈半徑：**
-```python
-def sample_params(rng):
-    out = {}
-    # out['intensity_abs'] = sample_intensity_abs(rng)
-    out['outer_r'] = sample_outer_r(rng)
-    return out
+```yaml
+description: "Phase 1 — 鎖定 intensity 範圍"   # 自由文字
+base_yaml: src_core/defects/type4_vector.yaml  # base，沒被 dims 蓋到的 key 走它
+
+dims:
+  intensity_abs:
+    type: range_pair
+    low:   {min: 2.0, max: 15.0}
+    width: {min: 2.0, max: 12.0}
+    high_cap: 30.0
+    decimals: 2
 ```
 
-**範例 B — 同時搜 intensity + outer_r + brightness：**
-```python
-def sample_params(rng):
-    out = {}
-    out['intensity_abs'] = sample_intensity_abs(rng)
-    out['outer_r'] = sample_outer_r(rng)
-    out['brightness'] = sample_brightness(rng)
-    return out
+### 兩種 sampler type
+
+| type | 輸出 | 適用 yaml key |
+|---|---|---|
+| `scalar_pair` | `[v, v]` | outer_r, brightness, gaussian_sigma, background, 所有 Zernike, epsilon, ellipticity, ellip_angle |
+| `range_pair` | `[[low, low+width]]` | intensity_abs |
+
+**`scalar_pair` 範例**：
+```yaml
+outer_r:
+  type: scalar_pair
+  range: {min: 30, max: 80}
+  decimals: 0     # 0 -> int, >=1 -> 該位小數的 float
+```
+
+**`range_pair` 範例**：
+```yaml
+intensity_abs:
+  type: range_pair
+  low:   {min: 2.0, max: 15.0}    # low 區間
+  width: {min: 2.0, max: 12.0}    # width 區間（high = low + width）
+  high_cap: 30.0                   # optional，high 上限
+  decimals: 2
+```
+
+### 常見實驗範例
+
+**只搜 outer_r**：複製 `_template.yaml`，uncomment `outer_r` 區塊。
+
+**同時搜 intensity + outer_r + brightness**：
+```yaml
+description: "3-D scan"
+base_yaml: src_core/defects/type4_vector.yaml
+
+dims:
+  intensity_abs:
+    type: range_pair
+    low: {min: 2.0, max: 15.0}
+    width: {min: 2.0, max: 12.0}
+    decimals: 2
+  outer_r:
+    type: scalar_pair
+    range: {min: 30, max: 80}
+    decimals: 0
+  brightness:
+    type: scalar_pair
+    range: {min: 2000, max: 10000}
+    decimals: 0
 ```
 
 > 注意：搜的維度越多，需要的 trial 數越多才能覆蓋（譬如 1 維 50 trial 夠，3 維可能要 100+）。
 
-### 已實作的採樣（Tier 由重要到次要）
+### 想要新的 sampler 形狀？
 
-**Tier 1 — 訊號 / 雜訊（最強烈推薦）**
-| 函式 | yaml key | 範圍 | base |
-|---|---|---|---|
-| `sample_intensity_abs` | `intensity_abs` | low∈[2,15], width∈[2,12] | [[8,12]] |
-| `sample_outer_r` | `outer_r` | [30, 100] | [60, 60] |
-| `sample_brightness` | `brightness` | [2000, 10000] | [5000, 5000] |
-| `sample_gaussian_sigma` | `gaussian_sigma` | [0.3, 3.5] | [1.5, 1.5] |
-| `sample_background` | `background` | [0, 20] | [5, 5] |
+加在 `src_search/search_space.py`：
+1. 寫一個 `_sample_xxx(spec, rng)` 函式
+2. 註冊進 `SAMPLERS` dict
+3. 在 spec 裡 `type: xxx` 引用
 
-**Tier 2 — 光學像差（Zernike，單位 wavelength）**
-| 函式 | yaml key | 範圍 |
-|---|---|---|
-| `sample_defocus` | `defocus` | ±1.5 |
-| `sample_astig_x/y` | `astig_x/y` | ±1.0 |
-| `sample_coma_x/y` | `coma_x/y` | ±0.8 |
-| `sample_spherical` | `spherical` | ±0.8 |
-| `sample_trefoil_x/y` | `trefoil_x/y` | ±0.5 |
-
-**Tier 3 — 光圈幾何**
-| 函式 | yaml key | 範圍 |
-|---|---|---|
-| `sample_epsilon` | `epsilon`（中心遮蔽比） | [0, 0.6] |
-| `sample_ellipticity` | `ellipticity` | ±0.3 |
-| `sample_ellip_angle` | `ellip_angle` | [0, 180]° |
-
-### 採樣範圍不滿意？
-
-直接改 `search_space.py` 對應 `sample_*()` 函式裡的 `rng.uniform(...)` 區間。譬如：
-```python
-def sample_outer_r(rng):
-    r = float(rng.uniform(30.0, 100.0))   # 改成你想要的範圍
-    return [round(r), round(r)]
-```
+`load_spec()` 會幫你 schema 驗證，type 錯了會給明確的錯誤訊息。
 
 ---
 
@@ -205,9 +242,12 @@ def sample_outer_r(rng):
 
 | 症狀 | 原因 | 解法 |
 |---|---|---|
-| `No tiff images found in ...` | 路徑錯，或檔名沒 `#X,Y` | 確認絕對路徑 + 檔名格式 |
-| `No images found in ...`（training） | training_dataset_path 錯 | 用絕對路徑 |
-| trial 跑到一半 OOM | psf_pool_size 太大 / batch 太大 | 降 psf_pool_size 或 bs |
+| `--spec and --output_root are required` | flag 沒給 | 看 `bash submit_search.sh --help` |
+| `spec file not found: ...` | spec 路徑錯 | 用 `src_search/search_configs/...` 開頭的相對路徑（從 project root） |
+| `dim 'xxx' has unknown type 'yyy'` | spec type 拼錯 | 改成 `scalar_pair` 或 `range_pair` |
+| `base_yaml does not exist: ...` | spec 裡 base_yaml 路徑錯 | 確認 yaml 還在原處，或改成絕對路徑 |
+| `No tiff images found in ...` | REAL_VALID_DIR 路徑錯，或檔名沒 `#X,Y` | 確認絕對路徑 + 檔名格式 |
+| trial 跑到一半 OOM | psf_pool_size 太大 / batch 太大 | 降 `--pool` 或 batch |
 | analyze 找不到 trial | 跑搜尋時你 cd 到別處 | 從 project root 跑 |
 
 ---

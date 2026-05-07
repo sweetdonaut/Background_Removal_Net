@@ -1,0 +1,13 @@
+# Working example — search defect contrast amplitude only.
+# Copy + edit this file when you want a different search dimension or range.
+
+description: "Search intensity_abs (low + width)"
+base_yaml: src_core/defects/type4_vector.yaml
+
+dims:
+  intensity_abs:
+    type: range_pair
+    low:   {min: 2.0, max: 15.0}
+    width: {min: 2.0, max: 12.0}
+    high_cap: 30.0
+    decimals: 2

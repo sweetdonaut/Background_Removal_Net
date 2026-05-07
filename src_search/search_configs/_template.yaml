@@ -1,0 +1,111 @@
+# Search spec template — copy this file, rename, then uncomment the dims you
+# want to search this run. Two parallel runs (different output_roots, different
+# spec files) do not interfere because spec is per-run input data.
+#
+# Two sampler types are available:
+#   scalar_pair  -> samples one v in range, emits [v, v]
+#                   (used for outer_r, brightness, gaussian_sigma, all
+#                    Zernike aberrations, aperture geometry)
+#   range_pair   -> samples low + width, emits [[low, low+width]]
+#                   (used for intensity_abs)
+#
+# `decimals` controls rounding: 0 -> python int, >=1 -> rounded float.
+
+description: "TEMPLATE — copy and customize per run"
+base_yaml: src_core/defects/type4_vector.yaml
+
+dims:
+
+  # ============================================================
+  # Tier 1: signal & noise
+  # ============================================================
+
+  # intensity_abs:
+  #   type: range_pair
+  #   low:   {min: 2.0, max: 15.0}
+  #   width: {min: 2.0, max: 12.0}
+  #   high_cap: 30.0
+  #   decimals: 2
+
+  # outer_r:
+  #   type: scalar_pair
+  #   range: {min: 30, max: 80}
+  #   decimals: 0
+
+  # brightness:
+  #   type: scalar_pair
+  #   range: {min: 2000, max: 10000}
+  #   decimals: 0
+
+  # gaussian_sigma:
+  #   type: scalar_pair
+  #   range: {min: 0.3, max: 3.5}
+  #   decimals: 2
+
+  # background:
+  #   type: scalar_pair
+  #   range: {min: 0.0, max: 20.0}
+  #   decimals: 1
+
+  # ============================================================
+  # Tier 2: optical aberrations (Zernike, units of wavelength)
+  # ============================================================
+
+  # defocus:
+  #   type: scalar_pair
+  #   range: {min: -1.5, max: 1.5}
+  #   decimals: 2
+
+  # astig_x:
+  #   type: scalar_pair
+  #   range: {min: -1.0, max: 1.0}
+  #   decimals: 2
+
+  # astig_y:
+  #   type: scalar_pair
+  #   range: {min: -1.0, max: 1.0}
+  #   decimals: 2
+
+  # coma_x:
+  #   type: scalar_pair
+  #   range: {min: -0.8, max: 0.8}
+  #   decimals: 2
+
+  # coma_y:
+  #   type: scalar_pair
+  #   range: {min: -0.8, max: 0.8}
+  #   decimals: 2
+
+  # spherical:
+  #   type: scalar_pair
+  #   range: {min: -0.8, max: 0.8}
+  #   decimals: 2
+
+  # trefoil_x:
+  #   type: scalar_pair
+  #   range: {min: -0.5, max: 0.5}
+  #   decimals: 2
+
+  # trefoil_y:
+  #   type: scalar_pair
+  #   range: {min: -0.5, max: 0.5}
+  #   decimals: 2
+
+  # ============================================================
+  # Tier 3: aperture geometry
+  # ============================================================
+
+  # epsilon:
+  #   type: scalar_pair
+  #   range: {min: 0.0, max: 0.6}
+  #   decimals: 2
+
+  # ellipticity:
+  #   type: scalar_pair
+  #   range: {min: -0.3, max: 0.3}
+  #   decimals: 2
+
+  # ellip_angle:
+  #   type: scalar_pair
+  #   range: {min: 0, max: 180}
+  #   decimals: 0

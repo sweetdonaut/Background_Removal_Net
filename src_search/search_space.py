@@ -1,154 +1,119 @@
-"""Yaml parameter sampling for the search.
+"""Sampler library + spec loader for the yaml search.
 
-Each sample_* function returns a yaml-compatible value for one parameter.
-sample_params() composes the active ones into one trial's yaml override dict.
+Search space is defined externally in a spec yaml (see src_search/search_configs/), not
+in this file. This module:
+    - implements the sampler primitives (scalar_pair, range_pair)
+    - validates and loads spec yamls
+    - turns a loaded spec + rng into a {yaml_key: sampled_value} override dict
 
-To change which parameters get searched:
-    1. All common sample_* are already implemented below.
-    2. In sample_params(), toggle (uncomment / comment) the lines you want.
-    3. No other file needs to change — run_trial.py picks up the new keys
-       automatically and writes them into trial_yaml.yaml.
-
-Yaml keys not touched here keep their type4_vector.yaml base value.
+To add a new searchable yaml key:
+    - if its shape fits an existing sampler (scalar_pair / range_pair), just
+      reference it from the spec; nothing to add here.
+    - if it needs a new shape, add a sampler function below and register it
+      in SAMPLERS.
 """
 
-import numpy as np
+import os
+
+import yaml
 
 
-# ============================================================
-# Strongly recommended: signal strength + size + noise level
-# ============================================================
+def _sample_scalar_pair(spec, rng):
+    """Sample one scalar v in [range.min, range.max], return [v, v].
 
-def sample_intensity_abs(rng):
-    """Defect contrast amplitude (single uniform range). Base = [[8, 12]]."""
-    low = float(rng.uniform(2.0, 15.0))
-    width = float(rng.uniform(2.0, 12.0))
-    high = min(30.0, low + width)
-    return [[round(low, 2), round(high, 2)]]
-
-
-def sample_outer_r(rng):
-    """Aperture outer radius (px) on the FFT grid. Smaller r -> larger PSF.
-    Base = [60, 60]."""
-    r = float(rng.uniform(30.0, 80.0))
-    return [round(r), round(r)]
-
-
-def sample_brightness(rng):
-    """PSF total energy (post-FFT normalization). Base = [5000, 5000]."""
-    b = float(rng.uniform(2000.0, 10000.0))
-    return [round(b), round(b)]
+    Spec keys:
+        range:    {min, max}
+        decimals: int (default 2). 0 -> python int, >=1 -> rounded float.
+    """
+    rmin = spec['range']['min']
+    rmax = spec['range']['max']
+    decimals = int(spec.get('decimals', 2))
+    v = float(rng.uniform(rmin, rmax))
+    if decimals == 0:
+        v = int(round(v))
+    else:
+        v = round(v, decimals)
+    return [v, v]
 
 
-def sample_gaussian_sigma(rng):
-    """Per-pixel sensor read-noise sigma. Base = [1.5, 1.5]."""
-    s = float(rng.uniform(0.3, 3.5))
-    return [round(s, 2), round(s, 2)]
+def _sample_range_pair(spec, rng):
+    """Sample low + width, return [[low, low + width]] (clipped at high_cap).
+
+    Used for keys like intensity_abs whose yaml form is a list-of-list mixture.
+
+    Spec keys:
+        low:      {min, max}
+        width:    {min, max}
+        high_cap: float (optional). Caps low + width.
+        decimals: int (default 2).
+    """
+    low = float(rng.uniform(spec['low']['min'], spec['low']['max']))
+    width = float(rng.uniform(spec['width']['min'], spec['width']['max']))
+    high = low + width
+    cap = spec.get('high_cap')
+    if cap is not None:
+        high = min(float(cap), high)
+    decimals = int(spec.get('decimals', 2))
+    low = round(low, decimals)
+    high = round(high, decimals)
+    return [[low, high]]
 
 
-def sample_background(rng):
-    """Per-pixel dark-current background (added before noise). Base = [5, 5]."""
-    bg = float(rng.uniform(0.0, 20.0))
-    return [round(bg, 1), round(bg, 1)]
+SAMPLERS = {
+    'scalar_pair': _sample_scalar_pair,
+    'range_pair': _sample_range_pair,
+}
 
 
-# ============================================================
-# Optical aberrations (Zernike coefficients in wavelengths)
-# Base = [0, 0] for all. Real high-NA systems usually within ±2 waves.
-# Larger values blur / asymmetrize the PSF.
-# ============================================================
+def load_spec(path):
+    """Read and validate a search spec yaml.
 
-def sample_defocus(rng):
-    a = float(rng.uniform(-1.5, 1.5))
-    return [round(a, 2), round(a, 2)]
+    Returns the parsed dict. Raises ValueError on schema problems with a
+    message specific enough to fix the spec without reading source.
+    """
+    with open(path) as f:
+        spec = yaml.safe_load(f)
 
+    if not isinstance(spec, dict):
+        raise ValueError(f"spec {path} must be a yaml mapping at the top level")
 
-def sample_astig_x(rng):
-    a = float(rng.uniform(-1.0, 1.0))
-    return [round(a, 2), round(a, 2)]
+    if 'base_yaml' not in spec or not isinstance(spec['base_yaml'], str):
+        raise ValueError(
+            f"spec {path} must define `base_yaml:` as a string path "
+            f"(relative to project root or absolute)")
 
+    dims = spec.get('dims')
+    if not isinstance(dims, dict) or not dims:
+        raise ValueError(f"spec {path} must define a non-empty `dims:` mapping")
 
-def sample_astig_y(rng):
-    a = float(rng.uniform(-1.0, 1.0))
-    return [round(a, 2), round(a, 2)]
+    for key, dim_spec in dims.items():
+        if not isinstance(dim_spec, dict):
+            raise ValueError(
+                f"spec {path}: dim {key!r} must be a mapping, "
+                f"got {type(dim_spec).__name__}")
+        type_ = dim_spec.get('type')
+        if type_ not in SAMPLERS:
+            raise ValueError(
+                f"spec {path}: dim {key!r} has unknown type {type_!r}; "
+                f"expected one of {sorted(SAMPLERS)}")
 
-
-def sample_coma_x(rng):
-    a = float(rng.uniform(-0.8, 0.8))
-    return [round(a, 2), round(a, 2)]
-
-
-def sample_coma_y(rng):
-    a = float(rng.uniform(-0.8, 0.8))
-    return [round(a, 2), round(a, 2)]
-
-
-def sample_spherical(rng):
-    a = float(rng.uniform(-0.8, 0.8))
-    return [round(a, 2), round(a, 2)]
-
-
-def sample_trefoil_x(rng):
-    a = float(rng.uniform(-0.5, 0.5))
-    return [round(a, 2), round(a, 2)]
+    return spec
 
 
-def sample_trefoil_y(rng):
-    a = float(rng.uniform(-0.5, 0.5))
-    return [round(a, 2), round(a, 2)]
+def resolve_base_yaml(spec, project_root):
+    """Return absolute path to base_yaml referenced by the spec."""
+    p = spec['base_yaml']
+    if not os.path.isabs(p):
+        p = os.path.join(project_root, p)
+    if not os.path.exists(p):
+        raise FileNotFoundError(f"base_yaml does not exist: {p}")
+    return p
 
 
-# ============================================================
-# Aperture geometry
-# ============================================================
-
-def sample_epsilon(rng):
-    """Inner/outer radius ratio (central obstruction, e.g. reflective scopes).
-    Base = [0, 0]. >0 turns the Airy disk into a more ring-like PSF."""
-    e = float(rng.uniform(0.0, 0.6))
-    return [round(e, 2), round(e, 2)]
-
-
-def sample_ellipticity(rng):
-    """Aperture ellipticity (elongates the PSF). Base = [0, 0]."""
-    e = float(rng.uniform(-0.3, 0.3))
-    return [round(e, 2), round(e, 2)]
-
-
-def sample_ellip_angle(rng):
-    """Ellipticity orientation in degrees. Base = [0, 0]."""
-    a = float(rng.uniform(0.0, 180.0))
-    return [round(a), round(a)]
-
-
-# ============================================================
-# Compose
-# ============================================================
-
-def sample_params(rng):
-    """Toggle (uncomment / comment) the lines you want to search."""
+def build_overrides(spec, rng):
+    """Sample every dim in spec, return {yaml_key: sampled_value}."""
     out = {}
-
-    # --- Tier 1: signal & noise (strongly recommended) ---
-    # out['intensity_abs'] = sample_intensity_abs(rng)
-    out['outer_r'] = sample_outer_r(rng)
-    # out['brightness'] = sample_brightness(rng)
-    # out['gaussian_sigma'] = sample_gaussian_sigma(rng)
-    # out['background'] = sample_background(rng)
-
-    # --- Tier 2: aberrations ---
-    # out['defocus'] = sample_defocus(rng)
-    # out['astig_x'] = sample_astig_x(rng)
-    # out['astig_y'] = sample_astig_y(rng)
-    # out['coma_x'] = sample_coma_x(rng)
-    # out['coma_y'] = sample_coma_y(rng)
-    # out['spherical'] = sample_spherical(rng)
-    # out['trefoil_x'] = sample_trefoil_x(rng)
-    # out['trefoil_y'] = sample_trefoil_y(rng)
-
-    # --- Tier 3: aperture shape ---
-    # out['epsilon'] = sample_epsilon(rng)
-    # out['ellipticity'] = sample_ellipticity(rng)
-    # out['ellip_angle'] = sample_ellip_angle(rng)
-
+    for key, dim_spec in spec['dims'].items():
+        sampler = SAMPLERS[dim_spec['type']]
+        out[key] = sampler(dim_spec, rng)
     return out
