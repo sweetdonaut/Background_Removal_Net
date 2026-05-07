@@ -40,6 +40,22 @@ TRAINING_DATASET_PATH=${TRAINING_DATASET_PATH:-data/grid_stripe_4channel/train/g
 
 > 絕對路徑跟相對路徑都支援。相對路徑會解讀成相對於你執行 `bash` 的 cwd（也就是 project root）。
 
+### Match radius（detection ↔ GT 容忍度）
+
+判斷一個 detection 是不是 TP 的距離門檻。模型輸出 peak 通常會比 GT 偏 1~4 px，
+門檻太嚴會讓「差一點點」算 miss、metric 會抖、trial 排名被噪音干擾。
+
+```bash
+# 預設 3.0 px（跟之前行為一致）
+bash src_search/submit_search.sh ...
+
+# Production 機台 peak 漂得比較遠 → 放寬到 5
+MATCH_RADIUS=5 bash src_search/submit_search.sh checkpoints/search_v2 50 20 1000
+
+# 跟 dead pixel / 路徑可以同時組合
+DEAD_PIXEL_CSV=/path/csv MATCH_RADIUS=5 bash src_search/submit_search.sh ...
+```
+
 ### Dead pixel mask（CCD 永久亮點）
 
 CCD 有固定亮點時，會在 heatmap 上產生永久 FP，把真正的 defect 從 top-150 擠出去。

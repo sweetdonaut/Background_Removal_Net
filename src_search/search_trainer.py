@@ -122,7 +122,7 @@ def train(args):
     dataset, dataloader = build_dataloader(args, patch_size)
     print(f'Dataset size: {len(dataset)} samples per epoch')
     print(f'Real valid dir: {args.real_valid_dir}')
-    print(f'Monitor metric: {args.main_metric}')
+    print(f'Monitor metric: {args.main_metric}  (match_radius={args.match_radius}px)')
 
     best_metric = -float('inf')
     best_epoch = -1
@@ -163,6 +163,7 @@ def train(args):
         if do_eval:
             metrics = evaluate_real(
                 model, args.real_valid_dir, patch_size, device,
+                match_radius=args.match_radius,
                 dead_pixel_csv=args.dead_pixel_csv,
                 dead_pixel_half_size=args.dead_pixel_half_size,
             )
@@ -247,6 +248,9 @@ def build_parser():
     parser.add_argument('--partial_leak_scale', type=float, nargs=2, default=[0.2, 0.7])
     parser.add_argument('--real_valid_dir', type=str, default='data/30ea_testing/bad')
     parser.add_argument('--main_metric', type=str, default='recall@50')
+    parser.add_argument('--match_radius', type=float, default=3.0,
+                        help='Pixel distance for detection<->GT match (default 3.0). '
+                             'Loosen for noisier production peaks.')
     parser.add_argument('--early_stop_patience', type=int, default=0)
     parser.add_argument('--eval_every', type=int, default=1)
     parser.add_argument('--dead_pixel_csv', type=str, default=None,

@@ -50,6 +50,7 @@ def main():
     parser.add_argument('--epochs', type=int, default=10)
     parser.add_argument('--early_stop_patience', type=int, default=0)
     parser.add_argument('--main_metric', type=str, default='recall@50')
+    parser.add_argument('--match_radius', type=float, default=3.0)
     parser.add_argument('--dead_pixel_csv', type=str, default=None)
     parser.add_argument('--dead_pixel_half_size', type=int, default=5)
 
@@ -108,6 +109,7 @@ def main():
         str(args.partial_leak_scale[1]),
         '--real_valid_dir', args.real_valid_dir,
         '--main_metric', args.main_metric,
+        '--match_radius', str(args.match_radius),
         '--early_stop_patience', str(args.early_stop_patience),
         '--seed', str(args.seed),
         '--dead_pixel_half_size', str(args.dead_pixel_half_size),
