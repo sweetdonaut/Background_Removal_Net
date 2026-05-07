@@ -23,6 +23,9 @@ def main():
     parser.add_argument('--test_dir', default='data/30ea_testing/bad')
     parser.add_argument('--gpu_id', type=int, default=0)
     parser.add_argument('--match_radius', type=float, default=3.0)
+    parser.add_argument('--score_window', type=int, default=2,
+                        help='Half-window around each peak for top-K score '
+                             'averaging. 2 -> 5x5 (default).')
     parser.add_argument('--dead_pixel_csv', type=str, default=None,
                         help='Defaults to <test_dir>/dead_pixels.csv if present.')
     parser.add_argument('--dead_pixel_half_size', type=int, default=5)
@@ -46,6 +49,7 @@ def main():
 
     metrics = evaluate_real(
         model, args.test_dir, patch_size, device,
+        score_window=args.score_window,
         match_radius=args.match_radius,
         dead_pixel_csv=args.dead_pixel_csv,
         dead_pixel_half_size=args.dead_pixel_half_size,

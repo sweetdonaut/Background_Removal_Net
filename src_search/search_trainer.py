@@ -74,6 +74,7 @@ def build_dataloader(args, patch_size):
         defect_mode=args.defect_mode,
         psf_config_paths=psf_config_paths,
         psf_pool_size=args.psf_pool_size,
+        partial_leak_prob=args.partial_leak_prob,
         partial_leak_scale=tuple(args.partial_leak_scale),
     )
     dataloader = DataLoader(
@@ -163,6 +164,7 @@ def train(args):
         if do_eval:
             metrics = evaluate_real(
                 model, args.real_valid_dir, patch_size, device,
+                score_window=args.score_window,
                 match_radius=args.match_radius,
                 dead_pixel_csv=args.dead_pixel_csv,
                 dead_pixel_half_size=args.dead_pixel_half_size,
@@ -235,8 +237,8 @@ def build_parser():
     parser.add_argument('--img_format', type=str, choices=['png_jpg', 'tiff'], default='tiff')
     parser.add_argument('--seed', type=int, default=None)
     parser.add_argument('--cache_size', type=int, default=0)
-    parser.add_argument('--gamma_start', type=float, default=1.0)
-    parser.add_argument('--gamma_end', type=float, default=3.0)
+    parser.add_argument('--gamma_start', type=float, default=2.0)
+    parser.add_argument('--gamma_end', type=float, default=2.0)
     parser.add_argument('--defect_mode', type=str, choices=['gaussian', 'psf'], default='psf')
     parser.add_argument('--psf_type', type=str, nargs='+', default=['type4_vector'])
     parser.add_argument('--psf_yaml_path', type=str, nargs='+', default=None,
@@ -245,12 +247,16 @@ def build_parser():
     parser.add_argument('--psf_pool_size', type=int, default=1000)
     parser.add_argument('--num_workers', type=int, default=7)
     parser.add_argument('--prefetch_factor', type=int, default=2)
-    parser.add_argument('--partial_leak_scale', type=float, nargs=2, default=[0.2, 0.7])
+    parser.add_argument('--partial_leak_prob', type=float, default=0.0)
+    parser.add_argument('--partial_leak_scale', type=float, nargs=2, default=[0.0, 0.0])
     parser.add_argument('--real_valid_dir', type=str, default='data/30ea_testing/bad')
     parser.add_argument('--main_metric', type=str, default='recall@50')
     parser.add_argument('--match_radius', type=float, default=3.0,
                         help='Pixel distance for detection<->GT match (default 3.0). '
                              'Loosen for noisier production peaks.')
+    parser.add_argument('--score_window', type=int, default=2,
+                        help='Half-window size around each peak for top-K score '
+                             'averaging. 2 -> 5x5 window (default).')
     parser.add_argument('--early_stop_patience', type=int, default=0)
     parser.add_argument('--eval_every', type=int, default=1)
     parser.add_argument('--dead_pixel_csv', type=str, default=None,

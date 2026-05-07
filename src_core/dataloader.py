@@ -14,6 +14,7 @@ from gaussian import (
 from generate_psf import load_config as load_psf_config, create_psf_defect
 from functools import lru_cache
 import psutil
+from tqdm import tqdm
 
 
 def parse_s3_path(s3_path):
@@ -94,9 +95,8 @@ def calculate_positions(img_size, patch_size, min_patches=2):
 # drift between captures, etc.). Synthetic training mirrors this by leaking
 # target-only defects to one ref at reduced intensity, with mask still
 # labeling the defect — so the model learns to detect even when a ref is
-# partially contaminated.
-# The leak probability is fixed; the scale range is per-Dataset (CLI-tunable).
-PARTIAL_LEAK_PROB = 0.4
+# partially contaminated. Both the trigger probability and the scale range
+# are per-Dataset (CLI-tunable).
 
 
 def sample_magnitude(spec):
@@ -134,18 +134,19 @@ class PsfDefectPool:
         for i, cfg in enumerate(psf_cfgs):
             pool = []
             failures = 0
-            while len(pool) < pool_size:
-                defect = create_psf_defect(cfg)
-                if defect is not None:
-                    pool.append(defect)
-                else:
-                    failures += 1
-                    if failures > pool_size * 10:
-                        raise RuntimeError(
-                            f"PSF config {i}: too many generation failures "
-                            f"({failures} failures, {len(pool)} successes)")
+            with tqdm(total=pool_size, desc=f"  Type {i}", unit="psf") as pbar:
+                while len(pool) < pool_size:
+                    defect = create_psf_defect(cfg)
+                    if defect is not None:
+                        pool.append(defect)
+                        pbar.update(1)
+                    else:
+                        failures += 1
+                        if failures > pool_size * 10:
+                            raise RuntimeError(
+                                f"PSF config {i}: too many generation failures "
+                                f"({failures} failures, {len(pool)} successes)")
             self.pools.append(pool)
-            print(f"  Type {i}: {pool_size} defects ready")
         self.num_types = len(self.pools)
 
     def sample(self):
@@ -167,13 +168,15 @@ class Dataset(Dataset):
                  defect_mode='gaussian', psf_config_paths=None,
                  psf_pool_size=1000,
                  intensity_abs=(60, 80),
-                 partial_leak_scale=(0.2, 0.7)):
+                 partial_leak_prob=0.0,
+                 partial_leak_scale=(0.0, 0.0)):
         self.patch_size = patch_size
         self.num_defects_range = num_defects_range
         self.img_format = img_format
         self.cache_size = cache_size
         self.defect_mode = defect_mode
         self.intensity_abs = intensity_abs
+        self.partial_leak_prob = partial_leak_prob
         self.partial_leak_scale = partial_leak_scale
 
         if defect_mode == 'psf':
@@ -460,7 +463,7 @@ class Dataset(Dataset):
         leak_to_ref1 = {}
         leak_to_ref2 = {}
         for tid in target_only_ids:
-            if np.random.rand() < PARTIAL_LEAK_PROB:
+            if np.random.rand() < self.partial_leak_prob:
                 scale = np.random.uniform(*self.partial_leak_scale)
                 if np.random.rand() < 0.5:
                     leak_to_ref1[tid] = scale

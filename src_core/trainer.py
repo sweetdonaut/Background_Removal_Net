@@ -315,6 +315,7 @@ def train_on_device(args):
         defect_mode=args.defect_mode,
         psf_config_paths=psf_config_paths,
         psf_pool_size=args.psf_pool_size,
+        partial_leak_prob=args.partial_leak_prob,
         partial_leak_scale=tuple(args.partial_leak_scale),
     )
     
@@ -415,10 +416,10 @@ def main():
                         help='Random seed for reproducibility')
     parser.add_argument('--cache_size', type=int, default=0,
                         help='Number of images to cache in memory (0 = no cache)')
-    parser.add_argument('--gamma_start', type=float, default=1.0,
-                        help='Starting gamma value for focal loss (default: 1.0)')
-    parser.add_argument('--gamma_end', type=float, default=3.0,
-                        help='Ending gamma value for focal loss (default: 3.0)')
+    parser.add_argument('--gamma_start', type=float, default=2.0,
+                        help='Starting gamma value for focal loss (default: 2.0)')
+    parser.add_argument('--gamma_end', type=float, default=2.0,
+                        help='Ending gamma value for focal loss (default: 2.0)')
     parser.add_argument('--defect_mode', type=str, choices=['gaussian', 'psf'], default='gaussian',
                         help='Defect generation mode')
     parser.add_argument('--psf_type', type=str, nargs='+', default=None,
@@ -429,10 +430,13 @@ def main():
                         help='Number of DataLoader workers (default: 7)')
     parser.add_argument('--prefetch_factor', type=int, default=2,
                         help='Batches prefetched per worker (default: 2, increase for S3)')
-    parser.add_argument('--partial_leak_scale', type=float, nargs=2, default=[0.2, 0.7],
+    parser.add_argument('--partial_leak_prob', type=float, default=0.0,
+                        help='Per target-only defect, probability it also leaks to one ref '
+                             'at reduced intensity (default: 0.0 — disabled).')
+    parser.add_argument('--partial_leak_scale', type=float, nargs=2, default=[0.0, 0.0],
                         metavar=('MIN', 'MAX'),
                         help='Range of intensity scale when a target-only defect leaks to a ref '
-                             '(default: 0.2 0.7). The leak probability is fixed at 0.4 in dataloader.')
+                             '(default: 0.0 0.0 — disabled).')
 
     args = parser.parse_args()
     
