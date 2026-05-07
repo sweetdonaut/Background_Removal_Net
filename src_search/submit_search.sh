@@ -37,11 +37,23 @@ PSF_POOL_SIZE=${4:-1000}
 #   TRAINING_DATASET_PATH=/path/to/clean_train bash src_search/submit_search.sh ...
 REAL_VALID_DIR=${REAL_VALID_DIR:-data/30ea_testing/bad}
 TRAINING_DATASET_PATH=${TRAINING_DATASET_PATH:-data/grid_stripe_4channel/train/good/}
+# Optional: CSV with (dead_x, dead_y) — heatmap masked around each pixel before
+# detection. If unset, evaluator auto-loads <REAL_VALID_DIR>/dead_pixels.csv if
+# that file exists. Set to empty string to force-disable.
+DEAD_PIXEL_CSV=${DEAD_PIXEL_CSV-}
 
 mkdir -p "$OUTPUT_ROOT"
 echo "Running $N_TRIALS sequential trials -> $OUTPUT_ROOT (epochs=$EPOCHS, pool=$PSF_POOL_SIZE)"
 echo "  real valid : $REAL_VALID_DIR"
 echo "  train data : $TRAINING_DATASET_PATH"
+if [ -n "$DEAD_PIXEL_CSV" ]; then
+    echo "  dead pixel : $DEAD_PIXEL_CSV"
+fi
+
+DEAD_PIXEL_FLAG=""
+if [ -n "$DEAD_PIXEL_CSV" ]; then
+    DEAD_PIXEL_FLAG="--dead_pixel_csv $DEAD_PIXEL_CSV"
+fi
 
 for i in $(seq 1 $N_TRIALS); do
     TRIAL_DIR="$OUTPUT_ROOT/trial_$(printf "%03d" $i)"
@@ -58,6 +70,7 @@ for i in $(seq 1 $N_TRIALS); do
         --real_valid_dir "$REAL_VALID_DIR" \
         --training_dataset_path "$TRAINING_DATASET_PATH" \
         --seed $((i * 1000 + 42)) \
+        $DEAD_PIXEL_FLAG \
         2>&1 | tee "$TRIAL_DIR/trial.log"
 done
 

@@ -40,6 +40,24 @@ TRAINING_DATASET_PATH=${TRAINING_DATASET_PATH:-data/grid_stripe_4channel/train/g
 
 > 絕對路徑跟相對路徑都支援。相對路徑會解讀成相對於你執行 `bash` 的 cwd（也就是 project root）。
 
+### Dead pixel mask（CCD 永久亮點）
+
+CCD 有固定亮點時，會在 heatmap 上產生永久 FP，把真正的 defect 從 top-150 擠出去。
+在 `<REAL_VALID_DIR>/dead_pixels.csv` 放一份座標檔，evaluator 會在算分前把每個座標
+周圍 10×10 bbox 的 heatmap 設為 0：
+
+```csv
+dead_x,dead_y
+112,87
+245,310
+390,200
+```
+
+- 預設**自動載入** `<REAL_VALID_DIR>/dead_pixels.csv`（如果存在），不用改任何東西
+- 想改路徑：`DEAD_PIXEL_CSV=/abs/path/to/file.csv bash src_search/submit_search.sh ...`
+- 想關掉：`DEAD_PIXEL_CSV="" bash ...`（或刪掉那個 csv）
+- 想改 bbox 大小：trainer / run_eval / run_trial 都接 `--dead_pixel_half_size`（預設 5 -> 10×10）
+
 ---
 
 ## Step 2 — 跑搜尋

@@ -12,6 +12,7 @@ Metric:
     the highest-scoring candidates first across the whole batch.
 """
 
+import csv
 import glob
 import os
 import re
@@ -41,6 +42,38 @@ def load_test_image(path):
     image = ensure_hwc(image)
     image = ensure_3ch(image)
     return image.astype(np.float32)
+
+
+def load_dead_pixels(csv_path):
+    """Read CSV with columns (dead_x, dead_y). Returns list of (x, y) ints.
+    Returns [] if csv_path is None or the file does not exist."""
+    if not csv_path or not os.path.exists(csv_path):
+        return []
+    out = []
+    with open(csv_path, newline='') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            out.append((int(row['dead_x']), int(row['dead_y'])))
+    return out
+
+
+def apply_dead_pixel_mask(heatmap, dead_pixels, half_size=5, fill_value=0.0):
+    """In-place mask of a (2*half_size)x(2*half_size) bbox around each dead pixel.
+    half_size=5 yields a 10x10 bbox per pixel.
+    fill_value=0.0 keeps the heatmap finite so percentile / score-window math
+    is unaffected; with softmax-of-class-1 backgrounds (~1e-3) the masked
+    region is guaranteed to fall below the top-1% threshold."""
+    if not dead_pixels:
+        return heatmap
+    H, W = heatmap.shape
+    for (cx, cy) in dead_pixels:
+        ys = max(0, cy - half_size)
+        ye = min(H, cy + half_size)
+        xs = max(0, cx - half_size)
+        xe = min(W, cx + half_size)
+        if ys < ye and xs < xe:
+            heatmap[ys:ye, xs:xe] = fill_value
+    return heatmap
 
 
 def sliding_window_heatmap(image, model, patch_size, device):
@@ -209,9 +242,17 @@ def evaluate_real(
     max_per_image=5,
     match_radius=3.0,
     top_k_list=(30, 50, 150),
+    dead_pixel_csv=None,
+    dead_pixel_half_size=5,
     verbose=False,
 ):
-    """Run model on test_dir, run production-style detection, return cross-image metrics."""
+    """Run model on test_dir, run production-style detection, return cross-image metrics.
+
+    dead_pixel_csv: optional path to a CSV with columns (dead_x, dead_y).
+        Each listed pixel masks a (2*dead_pixel_half_size)^2 bbox to 0 on the
+        heatmap before detection — kills permanent FPs from sensor dead pixels.
+        Defaults to '<test_dir>/dead_pixels.csv' if that file exists.
+    """
     model.eval()
 
     paths = sorted(
@@ -220,6 +261,15 @@ def evaluate_real(
     )
     if not paths:
         raise ValueError(f'No tiff images found in {test_dir}')
+
+    if dead_pixel_csv is None:
+        default_dp = os.path.join(test_dir, 'dead_pixels.csv')
+        if os.path.exists(default_dp):
+            dead_pixel_csv = default_dp
+    dead_pixels = load_dead_pixels(dead_pixel_csv)
+    if dead_pixels:
+        print(f'  [dead_pixel_mask] {len(dead_pixels)} pixels '
+              f'from {dead_pixel_csv} (bbox={2 * dead_pixel_half_size}px)')
 
     per_image = []
     for path in paths:
@@ -231,6 +281,7 @@ def evaluate_real(
 
         image = load_test_image(path)
         heatmap = sliding_window_heatmap(image, model, patch_size, device)
+        apply_dead_pixel_mask(heatmap, dead_pixels, half_size=dead_pixel_half_size)
         detections = detect_in_image(
             heatmap,
             top_pct=top_pct, mask_radius=mask_radius,

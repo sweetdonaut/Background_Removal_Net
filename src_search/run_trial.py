@@ -50,6 +50,8 @@ def main():
     parser.add_argument('--epochs', type=int, default=10)
     parser.add_argument('--early_stop_patience', type=int, default=0)
     parser.add_argument('--main_metric', type=str, default='recall@50')
+    parser.add_argument('--dead_pixel_csv', type=str, default=None)
+    parser.add_argument('--dead_pixel_half_size', type=int, default=5)
 
     parser.add_argument('--gpu_id', type=int, default=0)
     parser.add_argument('--bs', type=int, default=16)
@@ -84,7 +86,7 @@ def main():
     print(f'overrides: {overrides}')
     print(f'trial_dir: {trial_dir}\n')
 
-    trainer_args = build_parser().parse_args([
+    trainer_argv = [
         '--bs', str(args.bs),
         '--lr', str(args.lr),
         '--epochs', str(args.epochs),
@@ -108,7 +110,11 @@ def main():
         '--main_metric', args.main_metric,
         '--early_stop_patience', str(args.early_stop_patience),
         '--seed', str(args.seed),
-    ])
+        '--dead_pixel_half_size', str(args.dead_pixel_half_size),
+    ]
+    if args.dead_pixel_csv:
+        trainer_argv += ['--dead_pixel_csv', args.dead_pixel_csv]
+    trainer_args = build_parser().parse_args(trainer_argv)
     train(trainer_args)
 
 

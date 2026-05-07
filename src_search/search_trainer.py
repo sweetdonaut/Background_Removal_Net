@@ -162,7 +162,10 @@ def train(args):
         do_eval = (epoch + 1) % args.eval_every == 0 or epoch == args.epochs - 1
         if do_eval:
             metrics = evaluate_real(
-                model, args.real_valid_dir, patch_size, device)
+                model, args.real_valid_dir, patch_size, device,
+                dead_pixel_csv=args.dead_pixel_csv,
+                dead_pixel_half_size=args.dead_pixel_half_size,
+            )
             scalar_metrics = {k: v for k, v in metrics.items() if k != 'per_image'}
             per_defect = per_defect_summary(metrics['per_image'])
             history.append({'epoch': epoch, 'loss': avg_loss, **scalar_metrics})
@@ -246,6 +249,13 @@ def build_parser():
     parser.add_argument('--main_metric', type=str, default='recall@50')
     parser.add_argument('--early_stop_patience', type=int, default=0)
     parser.add_argument('--eval_every', type=int, default=1)
+    parser.add_argument('--dead_pixel_csv', type=str, default=None,
+                        help='CSV with (dead_x, dead_y) columns. Heatmap is masked '
+                             'around each pixel before detection. Defaults to '
+                             '<real_valid_dir>/dead_pixels.csv if present.')
+    parser.add_argument('--dead_pixel_half_size', type=int, default=5,
+                        help='Half-size of square mask around each dead pixel '
+                             '(default 5 -> 10x10 bbox).')
     return parser
 
 

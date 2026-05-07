@@ -11,6 +11,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from evaluator import (  # noqa: E402
+    apply_dead_pixel_mask,
     cross_image_metrics,
     detect_in_image,
 )
@@ -141,6 +142,27 @@ def main():
     print(f'  recall@1={m["recall@1"]:.3f}  recall@2={m["recall@2"]:.3f}')
     assert m['recall@1'] == 0.0, 'top-1 is B\'s FP, no TP yet'
     assert m['recall@2'] == 0.5, 'top-2 is A\'s TP, 1/2 GTs covered'
+    print('  PASS\n')
+
+    print('Test 8: dead pixel mask kills permanent FPs')
+    hm = np.full((H, W), 0.001, dtype=np.float32)
+    hm[100, 100] = 0.99   # dead pixel - should be masked away
+    hm[200, 200] = 0.95   # real defect - should survive
+    apply_dead_pixel_mask(hm, [(100, 100)], half_size=5)
+    dets = detect_in_image(hm, mask_radius=20, max_per_image=5)
+    coords = {(y, x) for y, x, _ in dets}
+    print(f'  detections after mask: {[(y, x, round(s, 3)) for y, x, s in dets]}')
+    assert (100, 100) not in coords, 'dead pixel should be masked'
+    assert (200, 200) in coords, 'real defect should survive'
+    # 10x10 bbox: cy-5..cy+5 = 95..105, so (104, 104) inside, (106, 106) outside
+    hm2 = np.full((H, W), 0.001, dtype=np.float32)
+    hm2[104, 104] = 0.99
+    apply_dead_pixel_mask(hm2, [(100, 100)], half_size=5)
+    assert hm2[104, 104] == 0.0, 'pixel inside bbox should be zeroed'
+    hm3 = np.full((H, W), 0.001, dtype=np.float32)
+    hm3[106, 106] = 0.99
+    apply_dead_pixel_mask(hm3, [(100, 100)], half_size=5)
+    assert hm3[106, 106] == 0.99, 'pixel outside bbox should be untouched'
     print('  PASS\n')
 
     print('All tests passed.')
