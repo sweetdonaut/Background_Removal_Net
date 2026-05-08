@@ -63,6 +63,7 @@ def main():
     parser.add_argument('--patch_size', type=int, default=128)
     parser.add_argument('--num_defects_range', type=int, nargs=2, default=[3, 8])
     parser.add_argument('--psf_pool_size', type=int, default=1000)
+    parser.add_argument('--psf_pool_workers', type=int, default=4)
     parser.add_argument('--num_workers', type=int, default=4)
     parser.add_argument('--partial_leak_prob', type=float, default=0.0)
     parser.add_argument('--partial_leak_scale', type=float, nargs=2, default=[0.0, 0.0])
@@ -112,6 +113,7 @@ def main():
         '--defect_mode', 'psf',
         '--psf_yaml_path', trial_yaml_path,
         '--psf_pool_size', str(args.psf_pool_size),
+        '--psf_pool_workers', str(args.psf_pool_workers),
         '--num_workers', str(args.num_workers),
         '--partial_leak_prob', str(args.partial_leak_prob),
         '--partial_leak_scale', str(args.partial_leak_scale[0]),

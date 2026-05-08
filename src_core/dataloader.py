@@ -4,6 +4,7 @@ import numpy as np
 import cv2
 import os
 import io
+import multiprocessing as mp
 from glob import glob
 import tifffile
 from gaussian import (
@@ -11,7 +12,7 @@ from gaussian import (
     create_local_gaussian_defect,
     apply_local_defect_to_background
 )
-from generate_psf import load_config as load_psf_config, create_psf_defect
+from generate_psf import load_config as load_psf_config, create_psf_defect, generate_one, clean_connected_peak
 from functools import lru_cache
 import psutil
 from tqdm import tqdm
@@ -124,30 +125,140 @@ def sample_magnitude(spec):
     )
 
 
-class PsfDefectPool:
-    """Pre-generated pool of PSF defects for efficient training."""
+def _psf_pool_worker_init():
+    """Pin BLAS threads to 1 inside each worker.
 
-    def __init__(self, psf_cfgs, pool_size=1000):
+    Each worker runs its own complex64 FFT; opening BLAS threads here would
+    oversubscribe (n_workers * BLAS_threads >> CPU cores) and slow things
+    down. Setting these env vars at worker start is too late for the parent
+    process but works for the FFT calls that happen inside this child.
+    """
+    os.environ['OMP_NUM_THREADS'] = '1'
+    os.environ['OPENBLAS_NUM_THREADS'] = '1'
+    os.environ['MKL_NUM_THREADS'] = '1'
+    os.environ['NUMEXPR_NUM_THREADS'] = '1'
+
+
+def _psf_pool_worker_make_one(args):
+    """Generate one cleaned, bbox-cropped, [0,1]-normalized PSF defect.
+
+    Mirrors create_psf_defect() but takes an explicit seed (not OS-derived)
+    so the parent can hand each worker a deterministic, non-overlapping
+    random stream via SeedSequence.spawn(). Returns None on cleaning
+    failure — caller retries with the next spawned seed.
+    """
+    cfg, child_seed = args
+    rng = np.random.default_rng(child_seed)
+    raw, _ = generate_one(cfg, rng)
+    cleaned = clean_connected_peak(raw, cfg.get('threshold_multiplier', 1.0))
+    nz = np.argwhere(cleaned > 0)
+    if len(nz) == 0:
+        return None
+    y0, x0 = nz.min(axis=0)
+    y1, x1 = nz.max(axis=0)
+    cropped = cleaned[y0:y1 + 1, x0:x1 + 1]
+    if cropped.max() > 0:
+        cropped = cropped / cropped.max()
+    return cropped.astype(np.float32)
+
+
+class PsfDefectPool:
+    """Pre-generated pool of PSF defects for efficient training.
+
+    Multiprocess pool builder: each worker generates one PSF independently,
+    seeded via numpy SeedSequence.spawn() so streams are guaranteed
+    non-overlapping. Pool size is achieved by oversampling seeds and
+    re-spawning extras when cleaning failures occur.
+    """
+
+    def __init__(self, psf_cfgs, pool_size=1000, n_workers=4, master_seed=None):
         self.pools = []
         self.cfgs = list(psf_cfgs)
-        print(f"Pre-generating PSF defect pool ({pool_size} per type)...")
+        n_workers = max(1, int(n_workers))
+        print(f"Pre-generating PSF defect pool ({pool_size} per type, "
+              f"n_workers={n_workers})...")
         for i, cfg in enumerate(psf_cfgs):
-            pool = []
-            failures = 0
-            with tqdm(total=pool_size, desc=f"  Type {i}", unit="psf") as pbar:
-                while len(pool) < pool_size:
-                    defect = create_psf_defect(cfg)
+            self.pools.append(self._build_one_pool(cfg, i, pool_size, n_workers, master_seed))
+        self.num_types = len(self.pools)
+
+    def _build_one_pool(self, cfg, type_idx, pool_size, n_workers, master_seed):
+        # Per-cfg SeedSequence so different cfg types get independent streams.
+        # If master_seed is None we still get a SeedSequence (entropy from OS),
+        # preserving the original "non-deterministic across runs" behavior.
+        cfg_master = np.random.SeedSequence(master_seed,
+                                            spawn_key=(type_idx,) if master_seed is not None else ())
+        # Initial batch — oversample slightly so most pools complete in one pass.
+        batch = max(pool_size + pool_size // 5, pool_size + 16)
+        seed_pool = list(cfg_master.spawn(batch))
+        seed_used = batch
+        max_attempts = pool_size * 10
+
+        pool = []
+        failures = 0
+
+        def _drain(results_iter, pbar):
+            for defect in results_iter:
+                if defect is not None:
+                    pool.append(defect)
+                    pbar.update(1)
+                    if len(pool) >= pool_size:
+                        return True
+                else:
+                    nonlocal_failures[0] += 1
+            return False
+
+        nonlocal_failures = [0]  # closure-mutable counter
+        with tqdm(total=pool_size, desc=f"  Type {type_idx}", unit="psf") as pbar:
+            if n_workers == 1:
+                # Sequential fallback (debug / single-core env). Same per-PSF
+                # logic as the worker function so behavior matches.
+                for seed in seed_pool:
+                    defect = _psf_pool_worker_make_one((cfg, seed))
                     if defect is not None:
                         pool.append(defect)
                         pbar.update(1)
+                        if len(pool) >= pool_size:
+                            break
                     else:
-                        failures += 1
-                        if failures > pool_size * 10:
+                        nonlocal_failures[0] += 1
+                # Top up if we still need more
+                while len(pool) < pool_size:
+                    if seed_used >= max_attempts:
+                        raise RuntimeError(
+                            f"PSF config {type_idx}: too many generation failures "
+                            f"({nonlocal_failures[0]} failures, {len(pool)} successes)")
+                    extra = cfg_master.spawn(pool_size - len(pool))
+                    seed_used += len(extra)
+                    for seed in extra:
+                        defect = _psf_pool_worker_make_one((cfg, seed))
+                        if defect is not None:
+                            pool.append(defect)
+                            pbar.update(1)
+                            if len(pool) >= pool_size:
+                                break
+                        else:
+                            nonlocal_failures[0] += 1
+            else:
+                # Multiprocess path: keep one Pool open across top-up batches
+                # to avoid repeated process fork/spawn overhead.
+                with mp.Pool(n_workers, initializer=_psf_pool_worker_init) as workers:
+                    args = [(cfg, s) for s in seed_pool]
+                    done = _drain(workers.imap_unordered(_psf_pool_worker_make_one, args),
+                                  pbar)
+                    while not done:
+                        if seed_used >= max_attempts:
                             raise RuntimeError(
-                                f"PSF config {i}: too many generation failures "
-                                f"({failures} failures, {len(pool)} successes)")
-            self.pools.append(pool)
-        self.num_types = len(self.pools)
+                                f"PSF config {type_idx}: too many generation failures "
+                                f"({nonlocal_failures[0]} failures, {len(pool)} successes)")
+                        deficit = pool_size - len(pool)
+                        # Oversample again to absorb continued failures.
+                        extra_count = max(deficit + deficit // 5, deficit + 8)
+                        extra = cfg_master.spawn(extra_count)
+                        seed_used += extra_count
+                        args = [(cfg, s) for s in extra]
+                        done = _drain(workers.imap_unordered(_psf_pool_worker_make_one, args),
+                                      pbar)
+        return pool
 
     def sample(self):
         cfg_idx = np.random.randint(self.num_types)
@@ -167,6 +278,7 @@ class Dataset(Dataset):
                  img_format='tiff', cache_size=0,
                  defect_mode='gaussian', psf_config_paths=None,
                  psf_pool_size=1000,
+                 psf_pool_workers=4,
                  intensity_abs=(60, 80),
                  partial_leak_prob=0.0,
                  partial_leak_scale=(0.0, 0.0)):
@@ -183,7 +295,8 @@ class Dataset(Dataset):
             if not psf_config_paths:
                 raise ValueError("psf_config_paths required for psf defect mode")
             psf_cfgs = [load_psf_config(p) for p in psf_config_paths]
-            self.defect_pool = PsfDefectPool(psf_cfgs, pool_size=psf_pool_size)
+            self.defect_pool = PsfDefectPool(
+                psf_cfgs, pool_size=psf_pool_size, n_workers=psf_pool_workers)
             print(f"Defect mode: PSF ({len(psf_cfgs)} types: {psf_config_paths})")
         else:
             print(f"Defect mode: Gaussian")

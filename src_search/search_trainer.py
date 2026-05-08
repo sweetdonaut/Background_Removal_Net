@@ -74,6 +74,7 @@ def build_dataloader(args, patch_size):
         defect_mode=args.defect_mode,
         psf_config_paths=psf_config_paths,
         psf_pool_size=args.psf_pool_size,
+        psf_pool_workers=args.psf_pool_workers,
         partial_leak_prob=args.partial_leak_prob,
         partial_leak_scale=tuple(args.partial_leak_scale),
     )
@@ -245,6 +246,10 @@ def build_parser():
                         help='Direct yaml file paths (overrides --psf_type). '
                              'Used by run_trial.py to load per-trial yamls.')
     parser.add_argument('--psf_pool_size', type=int, default=1000)
+    parser.add_argument('--psf_pool_workers', type=int, default=4,
+                        help='Multiprocess workers for PSF pool generation. '
+                             '4 is the sweet spot on 8-core machines (higher '
+                             'oversubscribes BLAS threads). 1 = sequential.')
     parser.add_argument('--num_workers', type=int, default=7)
     parser.add_argument('--prefetch_factor', type=int, default=2)
     parser.add_argument('--partial_leak_prob', type=float, default=0.0)
