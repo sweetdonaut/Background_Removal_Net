@@ -68,12 +68,15 @@ class FocalLoss(nn.Module):
         if alpha.device != logit.device:
             alpha = alpha.to(logit.device)
 
-        idx = target.cpu().long()
+        # Build one-hot directly on logit.device to avoid forcing a
+        # GPU->CPU sync per batch (.cpu()), a CPU scatter, and a transfer
+        # back to GPU. Same numeric result.
+        idx = target.long()
 
-        one_hot_key = torch.FloatTensor(target.size(0), num_class).zero_()
-        one_hot_key = one_hot_key.scatter_(1, idx, 1)
-        if one_hot_key.device != logit.device:
-            one_hot_key = one_hot_key.to(logit.device)
+        one_hot_key = torch.zeros(
+            target.size(0), num_class,
+            device=logit.device, dtype=logit.dtype,
+        ).scatter_(1, idx, 1)
 
         if self.smooth:
             one_hot_key = torch.clamp(
