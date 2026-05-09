@@ -5,3 +5,4 @@ data/
 checkpoints/
 output/
 .DS_Store
+src_invertfit/fitted/
