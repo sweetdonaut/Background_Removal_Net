@@ -29,6 +29,12 @@ def main():
     parser.add_argument('--dead_pixel_csv', type=str, default=None,
                         help='Defaults to <test_dir>/dead_pixels.csv if present.')
     parser.add_argument('--dead_pixel_half_size', type=int, default=5)
+    parser.add_argument('--extra_test_dirs', type=str, nargs='*', default=None,
+                        help='Optional GT-less folders that contribute as FP '
+                             'noise in the global ranking.')
+    parser.add_argument('--extra_sample_ratios', type=float, nargs='*', default=None,
+                        help='Sampling ratio (0..1) per extra dir.')
+    parser.add_argument('--extra_sample_seed', type=int, default=0)
     parser.add_argument('--verbose', action='store_true')
     args = parser.parse_args()
 
@@ -53,12 +59,23 @@ def main():
         match_radius=args.match_radius,
         dead_pixel_csv=args.dead_pixel_csv,
         dead_pixel_half_size=args.dead_pixel_half_size,
+        extra_test_dirs=args.extra_test_dirs,
+        extra_sample_ratios=args.extra_sample_ratios,
+        extra_sample_seed=args.extra_sample_seed,
         verbose=args.verbose,
     )
 
+    # r@500 only carries new info when extras inflate the detection pool
+    # past 500; otherwise it equals total_recall (fallback).
+    has_extras = metrics.get('n_extra_images', 0) > 0
     print('\n=== Metrics ===')
-    for k in ('recall@30', 'recall@50', 'recall@150',
-              'total_recall', 'n_total_detections', 'n_gts'):
+    keys = ['recall@30', 'recall@50', 'recall@150']
+    if has_extras:
+        keys.append('recall@500')
+    keys += ['total_recall', 'n_total_detections', 'n_gts']
+    if has_extras:
+        keys.append('n_extra_images')
+    for k in keys:
         if k in metrics:
             v = metrics[k]
             if isinstance(v, float):
@@ -66,7 +83,8 @@ def main():
             else:
                 print(f'  {k:22s} : {v}')
 
-    n_miss = sum(1 for p in metrics['per_image'] if p['gt_local_rank'] is None)
+    n_miss = sum(1 for p in metrics['per_image']
+                 if p.get('gt') is not None and p['gt_local_rank'] is None)
     print(f'  {"images_fully_missed":22s} : {n_miss}/{metrics["n_gts"]}')
 
 

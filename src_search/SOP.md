@@ -58,6 +58,45 @@ bash src_search/submit_search.sh --spec ... --output_root ...
 MATCH_RADIUS=5 bash src_search/submit_search.sh --spec ... --output_root ...
 ```
 
+### Extra FP-only 測試資料夾
+
+想讓 `recall@K` 在更多 FP 噪音下接受壓力測試，可以指定**額外的無 GT 資料夾**。
+這些圖會跑同樣的 detection pipeline，所有 detection 都當 FP 混進全域排序，
+擠真正 TP 的位置 — 適合用 6000 張 production 影像當作 FP 池。
+
+要點：
+- 檔名**不需要** `#X,Y`（有也會被忽略）
+- 每個資料夾配一個 sampling ratio（0~1），例如 0.1 = 隨機抽 10%
+- Sampling seed 預設為 0，固定不變 → 所有 trial 看到的是同一份 FP 池，公平比較
+- 多個 dir 可以一起給，token 數要相同
+- 同時新增了 `recall@500`，FP 池一拉大，top-30/50 容易爆掉，這個 K 更能反映表現
+
+```bash
+EXTRA_TEST_DIRS="data/extra_testing_image" \
+EXTRA_SAMPLE_RATIOS="0.1" \
+bash src_search/submit_search.sh \
+    --spec src_search/search_configs/intensity.yaml \
+    --output_root checkpoints/intensity_v1_with_fp \
+    --n_trials 50 --epochs 20 --pool 1000
+
+# 多個來源
+EXTRA_TEST_DIRS="data/extra_testing_image data/another_pool" \
+EXTRA_SAMPLE_RATIOS="0.1 0.05" \
+bash src_search/submit_search.sh ...
+
+# 改 sampling seed（極少用到）
+EXTRA_SAMPLE_SEED=42 EXTRA_TEST_DIRS=... EXTRA_SAMPLE_RATIOS=... bash ...
+```
+
+`run_eval.py` 也接同名 flag：
+
+```bash
+python src_search/run_eval.py \
+    --checkpoint <path> \
+    --extra_test_dirs data/extra_testing_image \
+    --extra_sample_ratios 0.1
+```
+
 ### Dead pixel mask（CCD 永久亮點）
 
 CCD 有固定亮點時，會在 heatmap 上產生永久 FP，把真正的 defect 從 top-150 擠出去。

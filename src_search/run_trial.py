@@ -56,6 +56,9 @@ def main():
     parser.add_argument('--score_window', type=int, default=2)
     parser.add_argument('--dead_pixel_csv', type=str, default=None)
     parser.add_argument('--dead_pixel_half_size', type=int, default=5)
+    parser.add_argument('--extra_test_dirs', type=str, nargs='*', default=None)
+    parser.add_argument('--extra_sample_ratios', type=float, nargs='*', default=None)
+    parser.add_argument('--extra_sample_seed', type=int, default=0)
 
     parser.add_argument('--gpu_id', type=int, default=0)
     parser.add_argument('--bs', type=int, default=16)
@@ -128,6 +131,15 @@ def main():
     ]
     if args.dead_pixel_csv:
         trainer_argv += ['--dead_pixel_csv', args.dead_pixel_csv]
+    if args.extra_test_dirs:
+        if not args.extra_sample_ratios or len(args.extra_sample_ratios) != len(args.extra_test_dirs):
+            raise SystemExit(
+                '--extra_sample_ratios must be supplied with the same length '
+                'as --extra_test_dirs.')
+        trainer_argv += ['--extra_test_dirs', *args.extra_test_dirs]
+        trainer_argv += ['--extra_sample_ratios',
+                         *[str(r) for r in args.extra_sample_ratios]]
+        trainer_argv += ['--extra_sample_seed', str(args.extra_sample_seed)]
     trainer_args = build_parser().parse_args(trainer_argv)
     train(trainer_args)
 

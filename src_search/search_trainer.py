@@ -169,6 +169,9 @@ def train(args):
                 match_radius=args.match_radius,
                 dead_pixel_csv=args.dead_pixel_csv,
                 dead_pixel_half_size=args.dead_pixel_half_size,
+                extra_test_dirs=args.extra_test_dirs,
+                extra_sample_ratios=args.extra_sample_ratios,
+                extra_sample_seed=args.extra_sample_seed,
             )
             scalar_metrics = {k: v for k, v in metrics.items() if k != 'per_image'}
             per_defect = per_defect_summary(metrics['per_image'])
@@ -184,11 +187,18 @@ def train(args):
             with open(os.path.join(args.checkpoint_path, 'epoch_log.jsonl'), 'a') as f:
                 f.write(json.dumps(log_record) + '\n')
 
+            # r@500 only carries new info when extras inflate the detection
+            # pool past 500; otherwise it equals total_recall (fallback).
+            if metrics.get('n_extra_images', 0) > 0:
+                r500_str = f'r@500={metrics["recall@500"]:.3f} '
+            else:
+                r500_str = ''
             print(f'\nEpoch [{epoch + 1}/{args.epochs}] '
                   f'loss={avg_loss:.4e} γ={gamma:.2f} '
                   f'r@30={metrics["recall@30"]:.3f} '
                   f'r@50={metrics["recall@50"]:.3f} '
                   f'r@150={metrics["recall@150"]:.3f} '
+                  f'{r500_str}'
                   f'total={metrics["total_recall"]:.3f}')
 
             current = metrics[args.main_metric]
@@ -271,6 +281,17 @@ def build_parser():
     parser.add_argument('--dead_pixel_half_size', type=int, default=5,
                         help='Half-size of square mask around each dead pixel '
                              '(default 5 -> 10x10 bbox).')
+    parser.add_argument('--extra_test_dirs', type=str, nargs='*', default=None,
+                        help='Optional GT-less folders that contribute as FP '
+                             'noise in the global ranking. Pair with '
+                             '--extra_sample_ratios.')
+    parser.add_argument('--extra_sample_ratios', type=float, nargs='*', default=None,
+                        help='Sampling ratio (0..1) per extra dir, same length '
+                             'as --extra_test_dirs.')
+    parser.add_argument('--extra_sample_seed', type=int, default=0,
+                        help='Seed for deterministic extra-dir sampling. '
+                             'Fixed across trials so the FP pool is identical '
+                             'for every trial in one search.')
     return parser
 
 

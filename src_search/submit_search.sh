@@ -80,6 +80,16 @@ DEAD_PIXEL_CSV=${DEAD_PIXEL_CSV-}
 # noisier peak localization.
 MATCH_RADIUS=${MATCH_RADIUS:-3.0}
 
+# Optional FP-only stress folders. Both vars are space-separated and must have
+# the same number of tokens. Example:
+#   EXTRA_TEST_DIRS="data/extra_testing_image data/another_extra"
+#   EXTRA_SAMPLE_RATIOS="0.1 0.05"
+# Sampling is deterministic via EXTRA_SAMPLE_SEED (default 0) so every trial
+# in a single search faces the same FP pool.
+EXTRA_TEST_DIRS=${EXTRA_TEST_DIRS:-}
+EXTRA_SAMPLE_RATIOS=${EXTRA_SAMPLE_RATIOS:-}
+EXTRA_SAMPLE_SEED=${EXTRA_SAMPLE_SEED:-0}
+
 mkdir -p "$OUTPUT_ROOT"
 
 # Snapshot spec into output_root so this batch's search space is preserved
@@ -96,10 +106,31 @@ echo "  match radius : $MATCH_RADIUS px"
 if [ -n "$DEAD_PIXEL_CSV" ]; then
     echo "  dead pixel   : $DEAD_PIXEL_CSV"
 fi
+if [ -n "$EXTRA_TEST_DIRS" ]; then
+    echo "  extra dirs   : $EXTRA_TEST_DIRS"
+    echo "  extra ratios : $EXTRA_SAMPLE_RATIOS"
+    echo "  extra seed   : $EXTRA_SAMPLE_SEED"
+fi
 
 DEAD_PIXEL_FLAG=""
 if [ -n "$DEAD_PIXEL_CSV" ]; then
     DEAD_PIXEL_FLAG="--dead_pixel_csv $DEAD_PIXEL_CSV"
+fi
+
+EXTRA_FLAGS=""
+if [ -n "$EXTRA_TEST_DIRS" ]; then
+    if [ -z "$EXTRA_SAMPLE_RATIOS" ]; then
+        echo "Error: EXTRA_SAMPLE_RATIOS must be set when EXTRA_TEST_DIRS is set."
+        exit 1
+    fi
+    # Token counts must match — bash word-splits on whitespace here intentionally.
+    n_dirs=$(echo $EXTRA_TEST_DIRS | wc -w)
+    n_ratios=$(echo $EXTRA_SAMPLE_RATIOS | wc -w)
+    if [ "$n_dirs" != "$n_ratios" ]; then
+        echo "Error: EXTRA_TEST_DIRS has $n_dirs entries but EXTRA_SAMPLE_RATIOS has $n_ratios."
+        exit 1
+    fi
+    EXTRA_FLAGS="--extra_test_dirs $EXTRA_TEST_DIRS --extra_sample_ratios $EXTRA_SAMPLE_RATIOS --extra_sample_seed $EXTRA_SAMPLE_SEED"
 fi
 
 for i in $(seq 1 $N_TRIALS); do
@@ -120,6 +151,7 @@ for i in $(seq 1 $N_TRIALS); do
         --match_radius "$MATCH_RADIUS" \
         --seed $((i * 1000 + 42)) \
         $DEAD_PIXEL_FLAG \
+        $EXTRA_FLAGS \
         2>&1 | tee "$TRIAL_DIR/trial.log"
 done
 

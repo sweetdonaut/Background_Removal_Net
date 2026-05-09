@@ -154,17 +154,26 @@ def detect_in_image(
     return detections
 
 
-def cross_image_metrics(per_image, match_radius=3.0, top_k_list=(30, 50, 150)):
+def cross_image_metrics(per_image, match_radius=3.0, top_k_list=(30, 50, 150, 500)):
     """Pool detections globally, sort by score, compute recall@K.
 
-    per_image: list of {'detections': [(y,x,score), ...], 'gt': (gx, gy), 'image_id': str}
+    per_image: list of {'detections': [(y,x,score), ...], 'gt': (gx, gy) or None,
+                        'image_id': str}
+
+    Entries with gt=None contribute their detections as FP-only noise: they raise
+    the global rank denominator without ever producing a TP, so recall@K becomes
+    stricter under more FP pressure. n_gts counts only entries with a real GT.
     """
     all_dets = []
     for entry in per_image:
-        gx, gy = entry['gt']
         img_id = entry['image_id']
+        gt = entry.get('gt')
         for (dy, dx, score) in entry['detections']:
-            is_tp = (dx - gx) ** 2 + (dy - gy) ** 2 <= match_radius ** 2
+            if gt is None:
+                is_tp = False
+            else:
+                gx, gy = gt
+                is_tp = (dx - gx) ** 2 + (dy - gy) ** 2 <= match_radius ** 2
             all_dets.append({
                 'score': score,
                 'is_tp': bool(is_tp),
@@ -173,7 +182,7 @@ def cross_image_metrics(per_image, match_radius=3.0, top_k_list=(30, 50, 150)):
 
     all_dets.sort(key=lambda d: -d['score'])
 
-    n_gts = len(per_image)
+    n_gts = sum(1 for e in per_image if e.get('gt') is not None)
     matched_imgs = set()
     cumulative = []
     for d in all_dets:
@@ -226,6 +235,8 @@ def per_defect_summary(per_image):
 
     out = {}
     for entry in per_image:
+        if entry.get('gt') is None:
+            continue
         defect_id = entry['image_id'].split('#')[0]
         gt_x, gt_y = entry['gt']
         img_id = entry['image_id']
@@ -248,6 +259,52 @@ def per_defect_summary(per_image):
     return out
 
 
+def _list_tiffs(d):
+    return sorted(
+        glob.glob(os.path.join(d, '*.tiff'))
+        + glob.glob(os.path.join(d, '*.tif'))
+    )
+
+
+def sample_extra_paths(extra_test_dirs, extra_sample_ratios, seed):
+    """Return list of (path, source_dir) pairs sampled from each extra dir.
+
+    Sampling is deterministic given seed so all trials in one search face the
+    same FP pool. Each ratio is clipped to [0, 1]; ratio=1 takes everything.
+    """
+    if not extra_test_dirs:
+        return []
+    if extra_sample_ratios is None or len(extra_sample_ratios) != len(extra_test_dirs):
+        raise ValueError(
+            f'extra_sample_ratios ({extra_sample_ratios}) must have same length '
+            f'as extra_test_dirs ({extra_test_dirs}).')
+
+    rng = np.random.default_rng(seed)
+    out = []
+    for d, ratio in zip(extra_test_dirs, extra_sample_ratios):
+        if not os.path.isdir(d):
+            raise ValueError(f'extra_test_dir does not exist: {d}')
+        ratio = float(ratio)
+        if not 0.0 <= ratio <= 1.0:
+            raise ValueError(f'extra_sample_ratio {ratio} out of [0, 1] for {d}')
+        all_paths = _list_tiffs(d)
+        if not all_paths:
+            print(f'  [extra_test_dir] no tiff in {d}, skipping')
+            continue
+        n = int(round(len(all_paths) * ratio))
+        if n <= 0:
+            print(f'  [extra_test_dir] ratio={ratio} -> 0 sampled from {d}, skipping')
+            continue
+        n = min(n, len(all_paths))
+        idx = rng.choice(len(all_paths), size=n, replace=False)
+        idx.sort()
+        for i in idx:
+            out.append((all_paths[i], d))
+        print(f'  [extra_test_dir] sampled {n}/{len(all_paths)} from {d} '
+              f'(ratio={ratio})')
+    return out
+
+
 def evaluate_real(
     model,
     test_dir,
@@ -259,9 +316,12 @@ def evaluate_real(
     score_topk=3,
     max_per_image=5,
     match_radius=3.0,
-    top_k_list=(30, 50, 150),
+    top_k_list=(30, 50, 150, 500),
     dead_pixel_csv=None,
     dead_pixel_half_size=5,
+    extra_test_dirs=None,
+    extra_sample_ratios=None,
+    extra_sample_seed=0,
     verbose=False,
 ):
     """Run model on test_dir, run production-style detection, return cross-image metrics.
@@ -270,6 +330,11 @@ def evaluate_real(
         Each listed pixel masks a (2*dead_pixel_half_size)^2 bbox to 0 on the
         heatmap before detection — kills permanent FPs from sensor dead pixels.
         Defaults to '<test_dir>/dead_pixels.csv' if that file exists.
+
+    extra_test_dirs / extra_sample_ratios: optional lists of GT-less folders
+        that contribute purely as FP noise to the global ranking. Each dir is
+        sampled by its ratio (0..1) using extra_sample_seed (default 0) so the
+        FP pool stays fixed across trials in a single search.
     """
     model.eval()
 
@@ -288,6 +353,9 @@ def evaluate_real(
     if dead_pixels:
         print(f'  [dead_pixel_mask] {len(dead_pixels)} pixels '
               f'from {dead_pixel_csv} (bbox={2 * dead_pixel_half_size}px)')
+
+    extra_paths = sample_extra_paths(
+        extra_test_dirs, extra_sample_ratios, extra_sample_seed)
 
     per_image = []
     for path in paths:
@@ -326,7 +394,34 @@ def evaluate_real(
                   f'local_rank={gt_match_local_rank}  '
                   f'n_det={len(detections)}  top={top_score:.4f}')
 
+    for path, source_dir in extra_paths:
+        image = load_test_image(path)
+        heatmap = sliding_window_heatmap(image, model, patch_size, device)
+        apply_dead_pixel_mask(heatmap, dead_pixels, half_size=dead_pixel_half_size)
+        detections = detect_in_image(
+            heatmap,
+            top_pct=top_pct, mask_radius=mask_radius,
+            score_window=score_window, score_topk=score_topk,
+            max_per_image=max_per_image,
+        )
+
+        # Tag image_id with source dir basename to keep ids unique even if a
+        # filename collides with the main test_dir.
+        src_tag = os.path.basename(os.path.normpath(source_dir))
+        per_image.append({
+            'image_id': f'{src_tag}/{os.path.basename(path)}',
+            'gt': None,
+            'detections': detections,
+            'gt_local_rank': None,
+        })
+
+        if verbose:
+            top_score = detections[0][2] if detections else 0.0
+            print(f'  [FP] {os.path.basename(path):35s}  '
+                  f'n_det={len(detections)}  top={top_score:.4f}')
+
     metrics = cross_image_metrics(
         per_image, match_radius=match_radius, top_k_list=top_k_list)
     metrics['per_image'] = per_image
+    metrics['n_extra_images'] = len(extra_paths)
     return metrics
