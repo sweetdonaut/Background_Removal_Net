@@ -151,8 +151,10 @@ def main():
     if not paths:
         raise SystemExit(f'No DefectID*.tiff under {args.input_dir}')
 
+    effective_starts = (fit_cfg.n_starts
+                        + (fit_cfg.n_starts // 2 if fit_cfg.sign_flip_init else 0))
     print(f'Processing {len(paths)} defect tiffs '
-          f'({fit_cfg.n_starts} starts × {fit_cfg.n_iters} iters each)\n')
+          f'({effective_starts} starts × {fit_cfg.n_iters} iters each)\n')
 
     rng = np.random.default_rng(args.seed)
     fitted = {}

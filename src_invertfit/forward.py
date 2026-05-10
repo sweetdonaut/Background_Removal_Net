@@ -72,11 +72,17 @@ def _bin_down(psf_fine, factor):
 
 def _apply_subpixel_shift(ux, uy, uz, x, y, cy, cx, psf_size):
     """Multiply pupil components by linear-phase factor → translates PSF by
-    (cy, cx) sensor pixels in image plane (Fourier shift theorem).
+    (-cy, -cx) sensor pixels in image plane (Fourier shift theorem applied
+    on the FFT input domain, so the image plane shift comes out negated).
 
     Phase factor = exp(-2πi (cx·u + cy·v) / N_sensor) where (u, v) are pupil
     coords on the FINE grid. The factor is independent of oversample because
     the shift is parameterized in sensor pixels, not fine pixels.
+
+    The sign convention is unimportant for the fit itself (Adam learns
+    whatever sign makes the prediction match the observation), but matters if
+    you ever want to interpret a fitted (cy, cx) as a physical PSF center
+    offset: the fitted value is the negative of the on-sensor offset.
     """
     phase = -2.0 * math.pi * (cx * x + cy * y) / float(psf_size)
     cos_p = torch.cos(phase)

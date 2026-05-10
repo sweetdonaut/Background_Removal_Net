@@ -103,7 +103,9 @@ def main():
     rng = np.random.default_rng(args.seed)
     psf_l1s, final_losses, I_errs = [], [], []
 
-    print(f'\n{args.n_trials} trials, {fit_cfg.n_starts} starts × {fit_cfg.n_iters} iters\n')
+    effective_starts = (fit_cfg.n_starts
+                        + (fit_cfg.n_starts // 2 if fit_cfg.sign_flip_init else 0))
+    print(f'\n{args.n_trials} trials, {effective_starts} starts × {fit_cfg.n_iters} iters\n')
 
     for trial in range(args.n_trials):
         theta_true = sample_theta_true(cfg_data, rng)

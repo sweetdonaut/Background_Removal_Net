@@ -146,7 +146,12 @@ def fit_one(observation, fixed_params, fit_cfg: FitConfig, fwd_cfg: ForwardConfi
             optimizer.step()
             history.append(loss.item())
 
-        final_loss = history[-1]
+        # history entries are pre-step losses; recompute with the post-step
+        # params so final_loss matches the theta we record below.
+        with torch.no_grad():
+            theta = _build_theta_dict(fit_params, fixed_tensors)
+            pred = differentiable_forward(theta, fwd_cfg)
+            final_loss = float(((pred - obs_norm) ** 2).mean().item())
         all_final_losses.append(final_loss)
 
         if final_loss < best['loss']:
@@ -189,13 +194,18 @@ class ThreeChannelFitConfig:
 
 
 def _build_radial_weight(H, W, sigma, device):
-    """Gaussian weight centered at (H/2, W/2). Used to focus loss on the PSF region."""
+    """Gaussian weight centered on the PSF (sensor pixel index H/2, W/2).
+
+    differentiable_forward crops `cropped = psf_sensor[s:s+crop_size, ...]`
+    where s = psf_size//2 - crop_size//2, so the PSF sits at pixel index
+    (H/2, W/2) in the crop — not (H-1)/2.
+    """
     yy, xx = torch.meshgrid(
         torch.arange(H, dtype=torch.float32, device=device),
         torch.arange(W, dtype=torch.float32, device=device),
         indexing='ij',
     )
-    cy, cx = (H - 1) / 2.0, (W - 1) / 2.0
+    cy, cx = H / 2.0, W / 2.0
     r2 = (yy - cy) ** 2 + (xx - cx) ** 2
     return torch.exp(-r2 / (2.0 * sigma ** 2))
 
@@ -345,7 +355,33 @@ def fit_three_channel(diff1, diff2, fixed_params,
             optimizer.step()
             history.append(loss.item())
 
-        final_loss = history[-1]
+        # history entries are pre-step losses; recompute with post-step params
+        # so final_loss / residual_l1 line up with the (theta, I, alpha, cy,
+        # cx) we record into best below.
+        with torch.no_grad():
+            theta = _build_theta_dict(fit_params, fixed_tensors)
+            if fit_cfg.fit_shift:
+                theta['cy'] = cy
+                theta['cx'] = cx
+            psf_post = differentiable_forward(theta, fwd_cfg)
+            I_post = torch.exp(log_I)
+            if fit_cfg.fit_alpha:
+                a1_post = torch.sigmoid(z1)
+                a2_post = torch.sigmoid(z2)
+            else:
+                a1_post = torch.zeros((), device=fwd_cfg.device)
+                a2_post = torch.zeros((), device=fwd_cfg.device)
+            r1_post = (diff1 - psf_post * I_post * (1.0 - a1_post)).abs()
+            r2_post = (diff2 - psf_post * I_post * (1.0 - a2_post)).abs()
+            per_pixel_post = torch.minimum(r1_post, r2_post) * weight_map
+            data_loss_post = per_pixel_post.sum() / weight_sum
+            reg_post = torch.zeros((), device=fwd_cfg.device)
+            if fit_cfg.fit_alpha:
+                reg_post = reg_post + fit_cfg.lambda_alpha * (a1_post ** 2 + a2_post ** 2)
+            if fit_cfg.fit_shift:
+                reg_post = reg_post + fit_cfg.lambda_shift * (cy ** 2 + cx ** 2)
+            final_loss = float((data_loss_post + reg_post).item())
+            final_residual_l1 = float(per_pixel_post.sum().item())
         all_final_losses.append(final_loss)
 
         if final_loss < best['loss']:
@@ -360,7 +396,7 @@ def fit_three_channel(diff1, diff2, fixed_params,
                 'alpha2': float(torch.sigmoid(z2).item()) if fit_cfg.fit_alpha else 0.0,
                 'cy': float(cy.item()) if fit_cfg.fit_shift else 0.0,
                 'cx': float(cx.item()) if fit_cfg.fit_shift else 0.0,
-                'residual_l1': float(per_pixel.sum().item()),
+                'residual_l1': final_residual_l1,
             }
 
     return {
