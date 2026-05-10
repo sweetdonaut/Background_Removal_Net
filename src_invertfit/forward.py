@@ -1,6 +1,6 @@
 """Differentiable PSF forward model in PyTorch.
 
-Mirrors src_core/generate_psf.py:generate_one() vector-mode path with three
+Mirrors src_core/generate_psf.py:generate_one() vector-mode path with five
 modifications needed for inverse fitting:
   1. Soft (sigmoid) pupil edges so geometric params (outer_r, epsilon,
      ellipticity, ellip_angle, na) carry gradient
@@ -8,13 +8,21 @@ modifications needed for inverse fitting:
      externally when constructing the synthetic observation
   3. Output normalized to sum=1 — brightness/background are absorbed by the
      fit-side scale parameter (log_I), not by theta
+  4. Optional sub-pixel translation (cy, cx) via Fourier shift theorem on
+     the pupil. Real PSF center has unknown ±0.5 sensor-pixel offset relative
+     to the integer (X, Y) coordinate from the filename; without this,
+     fit absorbs the offset as fake aberrations (defocus / coma).
+  5. Sensor pixel binning at oversample factor — generate PSF on
+     N_sensor * oversample fine grid, then sum-bin oversample×oversample
+     blocks. Models the finite-pixel-grid integration of a continuous PSF.
+     Mirrors production pixel_oversample (default 4 in type4_vector.yaml).
+     Binning offset is fixed at (0, 0) here since sub-pixel positioning is
+     handled by (cy, cx) — production uses random offset because each pool
+     PSF gets a different position; the fit only needs one consistent one.
 
 Vector mode is hard-coded ON (per project convention) and `pol_type` is fixed
-at module-call time. `pixel_oversample` is set to 1 in v1; the production
-pipeline uses 4 for sensor binning, but for shape recovery the difference is
-sub-pixel and absorbed by noise. Pupil obstructions (square_eps, stripes,
-outer_crop) are also omitted in v1 since the wafer optical setup keeps them
-all at 0 — easy to add back if production data ever uses them.
+at module-call time. Pupil obstructions (square_eps, stripes, outer_crop) are
+omitted since the wafer optical setup keeps them all at 0.
 """
 
 import math
@@ -37,10 +45,11 @@ def _soft_step(z, sharpness):
 
 @dataclass
 class ForwardConfig:
-    psf_size: int = 256
-    crop_size: int = 32
+    psf_size: int = 256          # sensor-grid size (matches production type4_vector.yaml)
+    crop_size: int = 32          # final cropped output edge (sensor pixels)
     pol_type: str = 'linX'
     mask_sharpness: float = 2.0
+    oversample: int = 4          # fine grid = psf_size * oversample (matches production)
     device: str = 'cuda'
 
 
@@ -48,6 +57,32 @@ def make_grid(N, device):
     coords = torch.arange(-(N // 2), N - N // 2, dtype=torch.float32, device=device)
     y, x = torch.meshgrid(coords, coords, indexing='ij')
     return x, y
+
+
+def _bin_down(psf_fine, factor):
+    """Sum factor×factor blocks → (N_sensor, N_sensor). Models sensor pixel
+    area integration. Mirrors production _bin_down() with offset=(0, 0)
+    (sub-pixel positioning is handled by Fourier shift on the pupil)."""
+    if factor == 1:
+        return psf_fine
+    N_fine = psf_fine.shape[0]
+    N_sensor = N_fine // factor
+    return psf_fine.reshape(N_sensor, factor, N_sensor, factor).sum(dim=(1, 3))
+
+
+def _apply_subpixel_shift(ux, uy, uz, x, y, cy, cx, psf_size):
+    """Multiply pupil components by linear-phase factor → translates PSF by
+    (cy, cx) sensor pixels in image plane (Fourier shift theorem).
+
+    Phase factor = exp(-2πi (cx·u + cy·v) / N_sensor) where (u, v) are pupil
+    coords on the FINE grid. The factor is independent of oversample because
+    the shift is parameterized in sensor pixels, not fine pixels.
+    """
+    phase = -2.0 * math.pi * (cx * x + cy * y) / float(psf_size)
+    cos_p = torch.cos(phase)
+    sin_p = torch.sin(phase)
+    shift = torch.complex(cos_p, sin_p)
+    return ux * shift, uy * shift, uz * shift
 
 
 def _polarization_components(pol_type, phi):
@@ -127,10 +162,22 @@ def _vector_pupil(mask, phase, x, y, outer_r, na, pol_type):
 
 
 def differentiable_forward(theta, cfg: ForwardConfig):
-    """theta dict -> normalized PSF (sum=1) of shape (crop_size, crop_size)."""
-    x, y = make_grid(cfg.psf_size, cfg.device)
+    """theta dict -> normalized PSF (sum=1) of shape (crop_size, crop_size).
 
-    # Annular mask with optional ellipticity (soft edges)
+    theta keys:
+        Required: outer_r, epsilon, ellipticity, ellip_angle, na, defocus,
+                  astig_x, astig_y, coma_x, coma_y, spherical, trefoil_x,
+                  trefoil_y (all torch tensors)
+        Optional: cy, cx — sub-pixel shift in sensor pixels. Sub-pixel
+                  translation via Fourier shift theorem on the pupil.
+                  Skipped when both keys are absent (= shift 0).
+    """
+    N_fine = cfg.psf_size * cfg.oversample
+    x, y = make_grid(N_fine, cfg.device)
+
+    # Annular mask with optional ellipticity (soft edges).
+    # outer_r is in fine-pixel units, matching production generate_psf.py
+    # behavior where outer_r=60 means radius 60 pixels of the fine grid.
     cos_a = torch.cos(theta['ellip_angle'] * math.pi / 180.0)
     sin_a = torch.sin(theta['ellip_angle'] * math.pi / 180.0)
     e_safe = torch.clamp(theta['ellipticity'], min=-0.95, max=0.95)
@@ -158,14 +205,23 @@ def differentiable_forward(theta, cfg: ForwardConfig):
     ux, uy, uz = _vector_pupil(mask, phase, x, y, theta['outer_r'],
                                theta['na'], cfg.pol_type)
 
+    # Optional sub-pixel shift via Fourier shift theorem on the pupil.
+    if 'cy' in theta and 'cx' in theta:
+        ux, uy, uz = _apply_subpixel_shift(
+            ux, uy, uz, x, y, theta['cy'], theta['cx'], cfg.psf_size)
+
     # Three FFTs, sum |.|^2 across polarization channels
     Ix = torch.fft.fftshift(torch.fft.fft2(ux)).abs() ** 2
     Iy = torch.fft.fftshift(torch.fft.fft2(uy)).abs() ** 2
     Iz = torch.fft.fftshift(torch.fft.fft2(uz)).abs() ** 2
-    psf = Ix + Iy + Iz
+    psf_fine = Ix + Iy + Iz
 
+    # Bin fine grid → sensor grid (sensor pixel area integration).
+    psf_sensor = _bin_down(psf_fine, cfg.oversample)
+
+    # Center crop on sensor grid + normalize sum=1
     s = cfg.psf_size // 2 - cfg.crop_size // 2
-    cropped = psf[s:s + cfg.crop_size, s:s + cfg.crop_size]
+    cropped = psf_sensor[s:s + cfg.crop_size, s:s + cfg.crop_size]
     cropped = cropped / (cropped.sum() + 1e-12)
     return cropped
 
@@ -173,7 +229,8 @@ def differentiable_forward(theta, cfg: ForwardConfig):
 def make_theta(values, device, requires_grad=False):
     """Build a {name: 0-d tensor} dict from a {name: float} dict.
 
-    All PARAM_NAMES must be present in `values`.
+    All PARAM_NAMES must be present. Optional sub-pixel shift keys (cy, cx)
+    are forwarded if present and ignored otherwise.
     """
     out = {}
     for k in PARAM_NAMES:
@@ -181,4 +238,8 @@ def make_theta(values, device, requires_grad=False):
             raise KeyError(f"missing param {k!r}; required: {PARAM_NAMES}")
         out[k] = torch.tensor(float(values[k]), dtype=torch.float32, device=device,
                               requires_grad=requires_grad)
+    for k in ('cy', 'cx'):
+        if k in values:
+            out[k] = torch.tensor(float(values[k]), dtype=torch.float32,
+                                  device=device, requires_grad=requires_grad)
     return out

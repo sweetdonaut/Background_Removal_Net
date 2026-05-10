@@ -31,9 +31,12 @@ from forward import (  # noqa: E402
 )
 
 
-# Prior ranges shared by Phase 0a sampling and the multi-start initializer.
-# Aligned with src_search/search_configs/optical.yaml; trefoil added (same
-# magnitude band as spherical), geometric params widened for fit robustness.
+# Fallback init ranges for when FitConfig is constructed without explicit
+# init_ranges (e.g. from a unit test or quick interactive use). Production
+# entry points (fit_real, phase0a, phase0b) override this dict from yaml.
+# cy/cx are sub-pixel shift in sensor-pixel units; the (X, Y) coordinate
+# from the filename is integer-rounded so the true PSF center sits within
+# ±0.5 pixel — initialize tight, prior keeps it tight unless data demands.
 DEFAULT_INIT_RANGES = {
     'defocus': (-1.5, 1.5),
     'astig_x': (-1.0, 1.0),
@@ -48,6 +51,8 @@ DEFAULT_INIT_RANGES = {
     'ellipticity': (-0.3, 0.3),
     'ellip_angle': (0.0, 180.0),
     'na': (0.85, 0.99),
+    'cy': (-0.5, 0.5),
+    'cx': (-0.5, 0.5),
 }
 
 
@@ -174,8 +179,10 @@ class ThreeChannelFitConfig:
     n_iters: int = 800
     lr: float = 0.05
     init_ranges: dict = field(default_factory=lambda: dict(DEFAULT_INIT_RANGES))
-    fit_alpha: bool = True       # if False, alpha1=alpha2=0 (Phase 0b sanity simplification)
+    fit_alpha: bool = True       # if False, alpha1=alpha2=0 (sanity simplification)
     lambda_alpha: float = 1e-3   # L2 prior to break (I, alpha) degeneracy
+    fit_shift: bool = True       # if False, cy=cx=0 fixed (no sub-pixel translation)
+    lambda_shift: float = 1e-3   # L2 prior on (cy, cx) — keeps shift small unless data demands
     radial_sigma_frac: float = 0.25  # weight std as fraction of crop size
     init_alpha_z: float = -2.0   # sigmoid(-2) ≈ 0.12 — small leak default
     sign_flip_init: bool = True  # also try negated-theta inits to escape twin basins
@@ -222,10 +229,12 @@ def fit_three_channel(diff1, diff2, fixed_params,
     fwd_cfg      : ForwardConfig (psf_size, crop_size=H=W, pol_type, device).
 
     Returns dict:
-        theta       : {name: float} for all PARAM_NAMES
+        theta       : {name: float} for all PARAM_NAMES (no cy/cx; those are
+                      observation-specific and reported separately)
         I           : fitted intensity (positive scalar)
         alpha1      : fitted leak coef in [0, 1]
         alpha2      : fitted leak coef in [0, 1]
+        cy, cx      : fitted sub-pixel shift (sensor pixels). 0 if fit_shift=False.
         loss        : best final loss across starts
         history     : per-iter loss for the best start
         all_losses  : final loss per start
@@ -272,7 +281,8 @@ def fit_three_channel(diff1, diff2, fixed_params,
                 yield s, flipped
 
     best = {'loss': float('inf'), 'theta': None, 'history': None,
-            'I': None, 'alpha1': None, 'alpha2': None, 'residual_l1': None}
+            'I': None, 'alpha1': None, 'alpha2': None,
+            'cy': None, 'cx': None, 'residual_l1': None}
     all_final_losses = []
 
     for _start_idx, init_vals in _make_starts():
@@ -288,15 +298,24 @@ def fit_three_channel(diff1, diff2, fixed_params,
             float(fit_cfg.init_alpha_z), dtype=torch.float32, device=fwd_cfg.device))
         z2 = torch.nn.Parameter(torch.tensor(
             float(fit_cfg.init_alpha_z), dtype=torch.float32, device=fwd_cfg.device))
+        cy = torch.nn.Parameter(torch.tensor(
+            0.0, dtype=torch.float32, device=fwd_cfg.device))
+        cx = torch.nn.Parameter(torch.tensor(
+            0.0, dtype=torch.float32, device=fwd_cfg.device))
 
         params_to_optim = list(fit_params.values()) + [log_I]
         if fit_cfg.fit_alpha:
             params_to_optim += [z1, z2]
+        if fit_cfg.fit_shift:
+            params_to_optim += [cy, cx]
         optimizer = torch.optim.Adam(params_to_optim, lr=fit_cfg.lr)
         history = []
 
         for _ in range(fit_cfg.n_iters):
             theta = _build_theta_dict(fit_params, fixed_tensors)
+            if fit_cfg.fit_shift:
+                theta['cy'] = cy
+                theta['cx'] = cx
             psf = differentiable_forward(theta, fwd_cfg)
             I = torch.exp(log_I)
             if fit_cfg.fit_alpha:
@@ -314,7 +333,11 @@ def fit_three_channel(diff1, diff2, fixed_params,
             per_pixel = torch.minimum(r1, r2) * weight_map
             data_loss = per_pixel.sum() / weight_sum
 
-            reg = fit_cfg.lambda_alpha * (alpha1 ** 2 + alpha2 ** 2) if fit_cfg.fit_alpha else 0.0
+            reg = 0.0
+            if fit_cfg.fit_alpha:
+                reg = reg + fit_cfg.lambda_alpha * (alpha1 ** 2 + alpha2 ** 2)
+            if fit_cfg.fit_shift:
+                reg = reg + fit_cfg.lambda_shift * (cy ** 2 + cx ** 2)
             loss = data_loss + reg
 
             optimizer.zero_grad()
@@ -335,6 +358,8 @@ def fit_three_channel(diff1, diff2, fixed_params,
                 'I': float(torch.exp(log_I).item()),
                 'alpha1': float(torch.sigmoid(z1).item()) if fit_cfg.fit_alpha else 0.0,
                 'alpha2': float(torch.sigmoid(z2).item()) if fit_cfg.fit_alpha else 0.0,
+                'cy': float(cy.item()) if fit_cfg.fit_shift else 0.0,
+                'cx': float(cx.item()) if fit_cfg.fit_shift else 0.0,
                 'residual_l1': float(per_pixel.sum().item()),
             }
 
@@ -343,6 +368,8 @@ def fit_three_channel(diff1, diff2, fixed_params,
         'I': best['I'],
         'alpha1': best['alpha1'],
         'alpha2': best['alpha2'],
+        'cy': best['cy'],
+        'cx': best['cx'],
         'loss': best['loss'],
         'history': best['history'],
         'all_losses': all_final_losses,

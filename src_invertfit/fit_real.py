@@ -1,15 +1,19 @@
-"""Phase 0c — fit inverse model on the 30 real PSF triplets.
+"""Fit the inverse model on a directory of real PSF triplets.
 
-For each tiff in data/30ea_testing/bad/:
+For each tiff in --input_dir matching `DefectID###.#X,Y.tiff`:
   1. preprocess_one() → diff1, diff2, target/ref crops
-  2. fit_three_channel() → theta, I, alpha1, alpha2, loss
+  2. fit_three_channel() → theta, I, alpha, (cy, cx), loss
   3. Save fitted dict to JSON keyed by defect_id
-  4. Render an 8-panel diagnostic PNG (raw triplet, diffs, fit, residuals)
+  4. Render an 8-panel diagnostic PNG
 
 Outputs (under --output_dir, default src_invertfit/fitted/):
-  fitted_theta.json   ← all 30 fits in one file (Phase 1 yaml exporter reads this)
+  fitted_theta.json   ← all fits in one file (export_yaml.py reads this)
   vis/<DefectID>.png  ← per-defect visualization
   summary.txt         ← human-readable per-defect line + aggregate stats
+
+Everything that controls the fit (forward grid, oversample, which physics
+params to fix vs fit, alpha/shift toggles, optimizer hyperparams) lives in
+the --config yaml; CLI flags here are only operational (paths, GPU, seed).
 """
 
 import argparse
@@ -26,33 +30,14 @@ import torch
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
+from config import load_fit_config, summarize  # noqa: E402
 from forward import ForwardConfig, differentiable_forward, make_theta  # noqa: E402
 from inverse_fit import ThreeChannelFitConfig, fit_three_channel  # noqa: E402
 from preprocess import preprocess_one  # noqa: E402
 
 
-# Aligned with src_core/defects/type4_vector.yaml (same baseline as Phase 0a/b)
-DEFAULT_FIXED = {
-    'outer_r': 60.0,
-    'epsilon': 0.0,
-    'ellipticity': 0.0,
-    'ellip_angle': 0.0,
-    'na': 0.95,
-}
-
-DEFAULT_FIT_PARAMS = (
-    'defocus', 'astig_x', 'astig_y', 'coma_x', 'coma_y',
-    'spherical', 'trefoil_x', 'trefoil_y',
-)
-
-
 def render_diagnostic(pre, fit_pred1_np, fit_pred2_np, fit_psf_np, out_path):
-    """8-panel visualization: 3 raw + 2 diffs + 1 fitted PSF + 2 residuals.
-
-    Layout:
-        target  ref1  ref2  fitted_PSF
-        diff1   diff2 resid1 resid2
-    """
+    """8-panel visualization: 3 raw + 2 diffs + 1 fitted PSF + 2 residuals."""
     target = pre['target']; ref1 = pre['ref1']; ref2 = pre['ref2']
     diff1 = pre['diff1']; diff2 = pre['diff2']
     resid1 = diff1 - fit_pred1_np
@@ -75,9 +60,9 @@ def render_diagnostic(pre, fit_pred1_np, fit_pred2_np, fit_psf_np, out_path):
 
     show(fig.add_subplot(gs[0, 0]), target, 'target',
          cmap='gray', vmin=raw_vmin, vmax=raw_vmax)
-    show(fig.add_subplot(gs[0, 1]), ref1,   f'ref1 (shift {pre["shift1"]})',
+    show(fig.add_subplot(gs[0, 1]), ref1, f'ref1 (shift {pre["shift1"]})',
          cmap='gray', vmin=raw_vmin, vmax=raw_vmax)
-    show(fig.add_subplot(gs[0, 2]), ref2,   f'ref2 (shift {pre["shift2"]})',
+    show(fig.add_subplot(gs[0, 2]), ref2, f'ref2 (shift {pre["shift2"]})',
          cmap='gray', vmin=raw_vmin, vmax=raw_vmax)
     show(fig.add_subplot(gs[0, 3]), fit_psf_np, 'fitted PSF (sum=1)',
          cmap='hot')
@@ -96,23 +81,49 @@ def render_diagnostic(pre, fit_pred1_np, fit_pred2_np, fit_psf_np, out_path):
     plt.close()
 
 
+def build_configs(cfg_data, device):
+    fwd = cfg_data['forward']
+    fit = cfg_data['fit']
+    fwd_cfg = ForwardConfig(
+        psf_size=fwd['psf_size'],
+        crop_size=fwd['crop_size'],
+        pol_type=fwd['pol_type'],
+        oversample=fwd['pixel_oversample'],
+        mask_sharpness=fwd['mask_sharpness'],
+        device=device,
+    )
+    fit_cfg = ThreeChannelFitConfig(
+        fit_param_names=cfg_data['fit_param_names'],
+        init_ranges=dict(cfg_data['fit_init_ranges']),
+        n_starts=int(fit['n_starts']),
+        n_iters=int(fit['n_iters']),
+        lr=float(fit['lr']),
+        fit_alpha=bool(fit['alpha']),
+        fit_shift=bool(fit['shift']),
+        lambda_alpha=float(fit['lambda_alpha']),
+        lambda_shift=float(fit['lambda_shift']),
+        radial_sigma_frac=float(fit['radial_sigma_frac']),
+        sign_flip_init=bool(fit['sign_flip_init']),
+        init_alpha_z=float(fit['init_alpha_z']),
+    )
+    return fwd_cfg, fit_cfg
+
+
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument('--config', default='src_invertfit/fit_configs/default.yaml',
+                        help='YAML controlling forward grid, physics params (fixed/fit), '
+                             'and fit hyperparams. Mirrors src_core/defects/*.yaml schema. '
+                             'See src_invertfit/fit_configs/default.yaml for an annotated example.')
     parser.add_argument('--input_dir', default='data/30ea_testing/bad',
-                        help='Directory with DefectID*.tiff triplets.')
+                        help='Directory with DefectID###.#X,Y.tiff triplets.')
     parser.add_argument('--output_dir', default='src_invertfit/fitted',
                         help='Where to write fitted_theta.json + vis/.')
-    parser.add_argument('--n_starts', type=int, default=10)
-    parser.add_argument('--n_iters', type=int, default=1000)
-    parser.add_argument('--lr', type=float, default=0.05)
-    parser.add_argument('--lambda_alpha', type=float, default=1e-3)
-    parser.add_argument('--no_alpha', action='store_true',
-                        help='Disable alpha fit (set alpha1=alpha2=0 fixed).')
-    parser.add_argument('--seed', type=int, default=0)
+    parser.add_argument('--seed', type=int, default=0,
+                        help='RNG seed for multi-start init (does NOT affect torch).')
     parser.add_argument('--gpu_id', type=int, default=0)
-    parser.add_argument('--psf_size', type=int, default=256)
-    parser.add_argument('--crop_size', type=int, default=32)
-    parser.add_argument('--reg_crop_size', type=int, default=96)
+    parser.add_argument('--reg_crop_size', type=int, default=96,
+                        help='Wider crop for sub-pixel registration (default 96).')
     parser.add_argument('--limit', type=int, default=0,
                         help='Process at most N tiffs (0 = all).')
     parser.add_argument('--no_vis', action='store_true',
@@ -123,19 +134,16 @@ def main():
               else 'cpu')
     print(f'Device: {device}')
 
+    cfg_data = load_fit_config(args.config)
+    print(summarize(cfg_data))
+    print()
+
+    fwd_cfg, fit_cfg = build_configs(cfg_data, device)
+
     os.makedirs(args.output_dir, exist_ok=True)
     vis_dir = os.path.join(args.output_dir, 'vis')
     if not args.no_vis:
         os.makedirs(vis_dir, exist_ok=True)
-
-    fwd_cfg = ForwardConfig(psf_size=args.psf_size, crop_size=args.crop_size,
-                            pol_type='linX', device=device)
-    fit_cfg = ThreeChannelFitConfig(
-        fit_param_names=DEFAULT_FIT_PARAMS,
-        n_starts=args.n_starts, n_iters=args.n_iters, lr=args.lr,
-        fit_alpha=(not args.no_alpha),
-        lambda_alpha=args.lambda_alpha,
-    )
 
     paths = sorted(glob.glob(os.path.join(args.input_dir, 'DefectID*.tiff')))
     if args.limit > 0:
@@ -152,16 +160,20 @@ def main():
 
     for i, path in enumerate(paths):
         pre = preprocess_one(path,
-                             fit_crop_size=args.crop_size,
+                             fit_crop_size=fwd_cfg.crop_size,
                              reg_crop_size=args.reg_crop_size)
         diff1 = torch.from_numpy(pre['diff1'].astype(np.float32)).to(device)
         diff2 = torch.from_numpy(pre['diff2'].astype(np.float32)).to(device)
 
-        result = fit_three_channel(diff1, diff2, DEFAULT_FIXED,
+        result = fit_three_channel(diff1, diff2, cfg_data['fixed_params'],
                                    fit_cfg, fwd_cfg, rng=rng)
 
-        # Compute predicted PSF + scaled diffs for visualization & residual report
-        theta_t = make_theta(result['theta'], device=device)
+        # Render fitted PSF (with sub-pixel shift if present) for visualization.
+        theta_for_render = dict(result['theta'])
+        if fit_cfg.fit_shift:
+            theta_for_render['cy'] = result['cy']
+            theta_for_render['cx'] = result['cx']
+        theta_t = make_theta(theta_for_render, device=device)
         with torch.no_grad():
             psf_norm = differentiable_forward(theta_t, fwd_cfg)
         psf_np = psf_norm.cpu().numpy()
@@ -170,7 +182,6 @@ def main():
         pred1_np = psf_np * I * (1.0 - a1)
         pred2_np = psf_np * I * (1.0 - a2)
 
-        # Per-pixel residual (no weight) — for human-readable diagnostic
         r1 = np.abs(pre['diff1'] - pred1_np)
         r2 = np.abs(pre['diff2'] - pred2_np)
         per_pixel_min = np.minimum(r1, r2)
@@ -184,6 +195,8 @@ def main():
             'I': result['I'],
             'alpha1': result['alpha1'],
             'alpha2': result['alpha2'],
+            'cy': result['cy'],
+            'cx': result['cx'],
             'loss': result['loss'],
             'residual_l1_total': float(per_pixel_min.sum()),
             'residual_l1_per_pixel': float(per_pixel_min.mean()),
@@ -194,13 +207,12 @@ def main():
         }
         fitted[pre['defect_id']] = record
 
-        # Print + accumulate summary line
         line = (f'[{i+1:2d}/{len(paths)}] {pre["defect_id"]}: '
                 f'loss={result["loss"]:.3e}  '
                 f'I={result["I"]:.1f}  '
                 f'a=({a1:.3f},{a2:.3f})  '
-                f'resid_pp={record["residual_l1_per_pixel"]:.3f}  '
-                f'shift1={pre["shift1"]} shift2={pre["shift2"]}')
+                f'shift_sub=({result["cy"]:+.2f},{result["cx"]:+.2f})  '
+                f'resid_pp={record["residual_l1_per_pixel"]:.3f}')
         print(line)
         summary_lines.append(line)
 
@@ -214,31 +226,24 @@ def main():
         json.dump({
             'meta': {
                 'input_dir': args.input_dir,
-                'fixed_params': DEFAULT_FIXED,
-                'fit_param_names': list(DEFAULT_FIT_PARAMS),
-                'fit_config': {
-                    'n_starts': fit_cfg.n_starts,
-                    'n_iters': fit_cfg.n_iters,
-                    'lr': fit_cfg.lr,
-                    'fit_alpha': fit_cfg.fit_alpha,
-                    'lambda_alpha': fit_cfg.lambda_alpha,
-                },
-                'forward': {
-                    'psf_size': fwd_cfg.psf_size,
-                    'crop_size': fwd_cfg.crop_size,
-                    'pol_type': fwd_cfg.pol_type,
-                },
+                'config': cfg_data['source_yaml'],
+                'forward': cfg_data['forward'],
+                'fixed_params': cfg_data['fixed_params'],
+                'fit_param_names': list(cfg_data['fit_param_names']),
+                'fit_init_ranges': {k: list(v) for k, v in cfg_data['fit_init_ranges'].items()},
+                'fit_hyperparams': cfg_data['fit'],
             },
             'fits': fitted,
         }, f, indent=2)
     print(f'\nWrote {json_path}')
 
-    # Aggregate stats
     losses = [f['loss'] for f in fitted.values()]
     resids_pp = [f['residual_l1_per_pixel'] for f in fitted.values()]
     Is = [f['I'] for f in fitted.values()]
     a1s = [f['alpha1'] for f in fitted.values()]
     a2s = [f['alpha2'] for f in fitted.values()]
+    cys = [f['cy'] for f in fitted.values()]
+    cxs = [f['cx'] for f in fitted.values()]
 
     aggregate = [
         '',
@@ -248,6 +253,8 @@ def main():
         f'  I (intensity) : median {np.median(Is):.1f}, range [{np.min(Is):.1f}, {np.max(Is):.1f}]',
         f'  alpha1        : median {np.median(a1s):.3f}, range [{np.min(a1s):.3f}, {np.max(a1s):.3f}]',
         f'  alpha2        : median {np.median(a2s):.3f}, range [{np.min(a2s):.3f}, {np.max(a2s):.3f}]',
+        f'  cy            : median {np.median(cys):+.3f}, range [{np.min(cys):+.3f}, {np.max(cys):+.3f}]',
+        f'  cx            : median {np.median(cxs):+.3f}, range [{np.min(cxs):+.3f}, {np.max(cxs):+.3f}]',
     ]
     for line in aggregate:
         print(line)

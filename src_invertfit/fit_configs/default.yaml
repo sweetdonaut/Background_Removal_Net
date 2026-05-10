@@ -1,0 +1,84 @@
+# Inverse-fit configuration.
+#
+# Schema mirrors src_core/defects/type4_vector.yaml: same field names mean the
+# same things. Production-only fields (intensity_abs, brightness, background,
+# gaussian_sigma, poisson_noise, threshold_multiplier, n_samples, output_dir)
+# are silently ignored if present, so a production yaml can be copied here
+# and edited.
+#
+# Physics parameter convention (same as production yaml-search):
+#   [v, v]   → FIXED at v (excluded from optimizer)
+#   [a, b]   → FITTED, multi-start init drawn uniformly from [a, b];
+#              Adam can move outside this range during optimization.
+#
+# Anything inverse-fit-specific that has no production counterpart lives
+# under the `fit:` namespace at the bottom.
+
+
+# === Forward-model architecture (matches production schema) ===
+psf_size: 256                  # sensor-grid edge (sensor pixels)
+crop_size: 32                  # final cropped output (sensor pixels)
+pixel_oversample: 4            # fine-grid factor; 1 = no binning (matches production type4_vector.yaml)
+vector_mode: true              # required (Richards-Wolf path is the only one ported)
+pol_type: linX                 # input polarization
+
+# === Pupil geometry (5 params) ===
+# All fixed by default to match production type4_vector.yaml. Open any of
+# these to fit by widening the range, e.g. outer_r: [50, 70].
+outer_r: [60, 60]
+epsilon: [0, 0]
+ellipticity: [0, 0]
+ellip_angle: [0, 0]
+na: [0.95, 0.95]
+
+# === Pupil obstructions (5 params, not implemented in fit forward) ===
+# Production type4_vector.yaml has all = 0; the fit forward assumes 0 and
+# does not read these. Kept as comments for reference.
+# square_eps: [0, 0]
+# h_stripe_w: [0, 0]
+# v_stripe_w: [0, 0]
+# h_outer_crop: [0, 0]
+# v_outer_crop: [0, 0]
+
+# === Zernike aberrations (8 params) ===
+# Default: all fit. Set any to [v, v] to fix at v. Ranges align with
+# src_search/search_configs/optical.yaml plus trefoil (same magnitude band).
+defocus: [-1.5, 1.5]
+astig_x: [-1.0, 1.0]
+astig_y: [-1.0, 1.0]
+coma_x: [-0.8, 0.8]
+coma_y: [-0.8, 0.8]
+spherical: [-0.8, 0.8]
+trefoil_x: [-0.8, 0.8]
+trefoil_y: [-0.8, 0.8]
+
+
+# === Inverse-fit-specific (no production counterpart) ===
+fit:
+  # Optional observation-specific fittable parameters.
+  # These are NOT exported to per-defect yamls (export_yaml.py) — they are
+  # observation properties of each real PSF, not generative parameters.
+  alpha: false                 # fit ref-leak coef alpha1, alpha2 (sigmoid-bounded)
+                               #   true: alpha free, controlled by lambda_alpha prior
+                               #   false: alpha forced to 0 (assumes refs are clean)
+                               #   note: open alpha tends to drift to ~0.5 by (I, alpha) degeneracy
+  shift: true                  # fit sub-pixel (cy, cx) Fourier shift
+                               #   true: cy/cx free, init at 0, controlled by lambda_shift
+                               #   false: cy=cx=0 (PSF center forced to grid center)
+
+  # L2 priors (break degeneracies / keep params bounded)
+  lambda_alpha: 1.0e-3
+  lambda_shift: 1.0e-3
+
+  # Loss weighting
+  radial_sigma_frac: 0.25      # Gaussian weight std as fraction of crop_size
+
+  # Forward soft-mask
+  mask_sharpness: 2.0          # sigmoid steepness for soft pupil edge
+
+  # Optimizer (multi-start Adam)
+  n_starts: 10
+  n_iters: 1000
+  lr: 0.05
+  sign_flip_init: true         # also try sign-flipped Zernike inits (twin-basin escape)
+  init_alpha_z: -2.0           # logit init for alpha (sigmoid(-2) ≈ 0.12)

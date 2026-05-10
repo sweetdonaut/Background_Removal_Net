@@ -1,0 +1,43 @@
+# "v1" — no Fourier shift, no pixel binning. Same as the original commit
+# before shift + oversample were added. Local validation (3 seeds) was:
+#   r@50  = 0.500 ± 0.208 (vs trial_002 0.544 ± 0.135)
+#   r@150 = 0.900 ± 0.115 (vs trial_002 0.756 ± 0.117, Cohen d = +1.24 LARGE win)
+#
+# Use this when you want to reproduce the "v1" yamls. With pixel_oversample=4
+# + fit.shift=true (the default config), the resulting yamls trained slightly
+# worse in our local A/B/C bake-off — physically more accurate fit doesn't
+# automatically mean training-optimal fit.
+
+psf_size: 256
+crop_size: 32
+pixel_oversample: 1            # ← v1: no fine-grid binning
+vector_mode: true
+pol_type: linX
+
+outer_r: [60, 60]
+epsilon: [0, 0]
+ellipticity: [0, 0]
+ellip_angle: [0, 0]
+na: [0.95, 0.95]
+
+defocus: [-1.5, 1.5]
+astig_x: [-1.0, 1.0]
+astig_y: [-1.0, 1.0]
+coma_x: [-0.8, 0.8]
+coma_y: [-0.8, 0.8]
+spherical: [-0.8, 0.8]
+trefoil_x: [-0.8, 0.8]
+trefoil_y: [-0.8, 0.8]
+
+fit:
+  alpha: false
+  shift: false                 # ← v1: no sub-pixel Fourier shift
+  lambda_alpha: 1.0e-3
+  lambda_shift: 1.0e-3
+  radial_sigma_frac: 0.25
+  mask_sharpness: 2.0
+  n_starts: 8
+  n_iters: 800
+  lr: 0.05
+  sign_flip_init: true
+  init_alpha_z: -2.0
