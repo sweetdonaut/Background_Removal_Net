@@ -189,6 +189,67 @@ python src_search/analyze_results.py --output_root checkpoints/intensity_v1
 
 ---
 
+## Step 3.5 — 大樣本 FP stress test（搜尋後驗證）
+
+`extra_test_dirs` 開太大（例如 ratio=1.0 的 6000 張）會讓 search 不可行 — 每張 trial 每個
+epoch 都要對全部 FP 跑 sliding-window heatmap，總時間爆炸。建議走**三階段工作流**：
+
+### 三階段工作流
+
+| 階段 | 目的 | 推薦設定 | 成本 |
+|---|---|---|---|
+| 1. Search | 比 trial 之間的相對排名 | `EXTRA_SAMPLE_RATIOS=0.05~0.1` | 每 trial eval 多 0.5–3 分鐘 |
+| 2. Stress test | 對 leaderboard top-3 做完整 FP 驗證 | `--extra_sample_ratios 1.0` 配 `run_eval.py` | 每張 ckpt 10–30 分鐘 |
+| 3. Pre-deploy | 上線前最終 sanity check | ratio=1.0 + 加 production 真資料當另一個 extra dir | 跑一次而已 |
+
+### Stage 1（搜尋）
+
+```bash
+EXTRA_TEST_DIRS="data/extra_testing_image" \
+EXTRA_SAMPLE_RATIOS="0.1" \
+bash src_search/submit_search.sh \
+    --spec src_search/search_configs/intensity.yaml \
+    --output_root checkpoints/intensity_v1 \
+    --n_trials 50 --epochs 20
+```
+
+跑完用 `analyze_results.py` 看 leaderboard，挑 top-3 trial。
+
+### Stage 2（stress test top-3）
+
+對每個 winner 的 best ckpt **單獨**跑一次完整 FP eval：
+
+```bash
+python src_search/run_eval.py \
+    --checkpoint checkpoints/intensity_v1/trial_007/BgRemoval_search_..._best.pth \
+    --extra_test_dirs data/extra_testing_image \
+    --extra_sample_ratios 1.0 \
+    --extra_sample_seed 0 \
+    --verbose
+```
+
+**判讀規則**：
+- 三個 winner 在 ratio=1.0 下 r@30/50/150/500 排名跟 stage 1 一致 → 搜尋結論可信，挑第一名上線
+- 排名翻盤 → 代表搜尋的 ratio=0.1 取樣不夠刻薄、把對 FP 弱的 trial 拉太前；要加大 stage 1 ratio 重搜
+
+> ⚠️ **`run_eval.py` 的輸出不會接進 `analyze_results.py`**。它只把 metric 印 stdout，
+> 不寫 `summary.json` / `epoch_log.jsonl`。Stage 2 是給人眼比 metric 用的，不是
+> multi-trial 分析。如果未來要把 stage 2 結果灌進 analyze_results，需要加一個
+> bridge script 把 `run_eval` 結果包成 trial 目錄結構 — 目前還沒寫。
+
+### 還是想加快 search 階段？
+
+| 旋鈕 | 效果 | 副作用 |
+|---|---|---|
+| `--eval_every 5` | eval 次數除以 5 | best_epoch 解析度變粗 |
+| 縮 `--n_trials` | 線性省時間 | 搜尋空間覆蓋變差 |
+| 縮 `--epochs` 配 early_stop | 收斂的 trial 提早結束 | 慢收斂的 trial 可能被截 |
+| 改 evaluator 用 batch inference | 16 patches/張 batch 起來 → eval 快 4–8 倍 | 需改 evaluator.py（目前是 bs=1）|
+
+最後一個沒人改之前都還在 bs=1 — 要常態用大 ratio search 的話這是值得做的小工程。
+
+---
+
 ## Step 4 — 換要實驗的參數
 
 新流程：spec yaml = 一次搜尋的「實驗意圖」。要換實驗就**複製 / 編輯 spec yaml**。
