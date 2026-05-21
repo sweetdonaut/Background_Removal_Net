@@ -1,13 +1,26 @@
-# Working example — search defect contrast amplitude only.
-# Copy + edit this file when you want a different search dimension or range.
+# Working example — search defect contrast amplitude + sensor sampling +
+# model input channels. Copy + edit when you want a different search.
 
-description: "Search intensity_abs (low + width)"
+description: "Search intensity_abs + pixel_oversample + input_channels"
 base_yaml: src_core/defects/type4_vector.yaml
 
-dims:
+dims:                                # written into trial PSF yaml
   intensity_abs:
     type: range_pair
     low:   {min: 2.0, max: 15.0}
     width: {min: 2.0, max: 12.0}
     high_cap: 30.0
     decimals: 2
+
+  pixel_oversample:                  # scalar key in PSF yaml — categorical
+    type: categorical
+    values: [1, 2, 4, 8]
+
+trainer_dims:                        # passed as CLI flag, NOT in PSF yaml
+  input_channels:
+    type: categorical
+    values:
+      - [target, ref1, ref2]
+      - [double_det]
+      - [target, double_det]
+      - [target, diff1, diff2, double_det]

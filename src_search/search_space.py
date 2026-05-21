@@ -59,17 +59,83 @@ def _sample_range_pair(spec, rng):
     return [[low, high]]
 
 
+def _sample_scalar(spec, rng):
+    """Sample one scalar v in [range.min, range.max], return v (not a pair).
+
+    Differs from scalar_pair: returns the bare value (e.g. 4) instead of
+    [v, v]. Use for yaml keys that are scalars in the PSF config — like
+    `pixel_oversample`, `crop_size`, `psf_size`.
+
+    Spec keys:
+        range:    {min, max}
+        decimals: int (default 2). 0 -> python int, >=1 -> rounded float.
+    """
+    rmin = spec['range']['min']
+    rmax = spec['range']['max']
+    decimals = int(spec.get('decimals', 2))
+    v = float(rng.uniform(rmin, rmax))
+    if decimals == 0:
+        return int(round(v))
+    return round(v, decimals)
+
+
+def _sample_categorical(spec, rng):
+    """Pick one value uniformly from a fixed list.
+
+    Each value can be any yaml-serializable type: scalar (e.g. 4), string
+    (e.g. 'linX'), or list (e.g. ['target', 'double_det'] for input_channels).
+    A list value is deep-copied to avoid sharing the spec object across trials.
+
+    Spec keys:
+        values: non-empty list of allowed values.
+    """
+    values = spec.get('values')
+    if not isinstance(values, list) or not values:
+        raise ValueError("categorical sampler requires non-empty `values:` list")
+    chosen = values[int(rng.integers(0, len(values)))]
+    return list(chosen) if isinstance(chosen, list) else chosen
+
+
 SAMPLERS = {
     'scalar_pair': _sample_scalar_pair,
     'range_pair': _sample_range_pair,
+    'scalar': _sample_scalar,
+    'categorical': _sample_categorical,
 }
+
+
+def _validate_dim_block(name, dims, path):
+    """Validate a dims-shaped mapping. dims may be None or empty (skipped)."""
+    if dims is None:
+        return
+    if not isinstance(dims, dict):
+        raise ValueError(
+            f"spec {path}: `{name}:` must be a mapping, "
+            f"got {type(dims).__name__}")
+    for key, dim_spec in dims.items():
+        if not isinstance(dim_spec, dict):
+            raise ValueError(
+                f"spec {path}: {name}.{key!r} must be a mapping, "
+                f"got {type(dim_spec).__name__}")
+        type_ = dim_spec.get('type')
+        if type_ not in SAMPLERS:
+            raise ValueError(
+                f"spec {path}: {name}.{key!r} has unknown type {type_!r}; "
+                f"expected one of {sorted(SAMPLERS)}")
 
 
 def load_spec(path):
     """Read and validate a search spec yaml.
 
-    Returns the parsed dict. Raises ValueError on schema problems with a
-    message specific enough to fix the spec without reading source.
+    Schema:
+        base_yaml:    str (required) — path to PSF yaml to seed trial configs
+        dims:         mapping of {yaml_key: sampler_spec} — overrides written
+                      into the trial PSF yaml (PSF-level search)
+        trainer_dims: optional mapping of {cli_key: sampler_spec} — overrides
+                      passed through as CLI args to search_trainer (trainer-
+                      level search, e.g. input_channels)
+
+    At least one of `dims` / `trainer_dims` must be non-empty.
     """
     with open(path) as f:
         spec = yaml.safe_load(f)
@@ -82,21 +148,15 @@ def load_spec(path):
             f"spec {path} must define `base_yaml:` as a string path "
             f"(relative to project root or absolute)")
 
-    dims = spec.get('dims')
-    if not isinstance(dims, dict) or not dims:
-        raise ValueError(f"spec {path} must define a non-empty `dims:` mapping")
+    dims = spec.get('dims') or {}
+    trainer_dims = spec.get('trainer_dims') or {}
+    if not dims and not trainer_dims:
+        raise ValueError(
+            f"spec {path} must define at least one of `dims:` or "
+            f"`trainer_dims:` with at least one entry")
 
-    for key, dim_spec in dims.items():
-        if not isinstance(dim_spec, dict):
-            raise ValueError(
-                f"spec {path}: dim {key!r} must be a mapping, "
-                f"got {type(dim_spec).__name__}")
-        type_ = dim_spec.get('type')
-        if type_ not in SAMPLERS:
-            raise ValueError(
-                f"spec {path}: dim {key!r} has unknown type {type_!r}; "
-                f"expected one of {sorted(SAMPLERS)}")
-
+    _validate_dim_block('dims', dims, path)
+    _validate_dim_block('trainer_dims', trainer_dims, path)
     return spec
 
 
@@ -111,9 +171,25 @@ def resolve_base_yaml(spec, project_root):
 
 
 def build_overrides(spec, rng):
-    """Sample every dim in spec, return {yaml_key: sampled_value}."""
+    """Sample every dim in spec['dims'], return {yaml_key: sampled_value}.
+
+    These overrides are written into the trial PSF yaml.
+    """
     out = {}
-    for key, dim_spec in spec['dims'].items():
+    for key, dim_spec in (spec.get('dims') or {}).items():
+        sampler = SAMPLERS[dim_spec['type']]
+        out[key] = sampler(dim_spec, rng)
+    return out
+
+
+def build_trainer_overrides(spec, rng):
+    """Sample every dim in spec['trainer_dims'], return {cli_key: sampled_value}.
+
+    These overrides are passed through to search_trainer as CLI args. Use for
+    parameters that don't belong in the PSF yaml (e.g. input_channels).
+    """
+    out = {}
+    for key, dim_spec in (spec.get('trainer_dims') or {}).items():
         sampler = SAMPLERS[dim_spec['type']]
         out[key] = sampler(dim_spec, rng)
     return out

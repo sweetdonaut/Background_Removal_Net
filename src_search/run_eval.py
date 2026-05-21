@@ -46,11 +46,14 @@ def main():
 
     ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
     patch_size = (ckpt['img_height'], ckpt['img_width'])
+    input_channels = ckpt.get('input_channels', ['target', 'ref1', 'ref2'])
+    in_channels = len(input_channels)
     print(f'Checkpoint: {args.checkpoint}')
     print(f'  patch_size: {patch_size}')
+    print(f'  input_channels ({in_channels}): {input_channels}')
     print(f'  epoch: {ckpt.get("epoch", "?")}')
 
-    model = SegmentationNetwork(in_channels=3, out_channels=2).to(device)
+    model = SegmentationNetwork(in_channels=in_channels, out_channels=2).to(device)
     model.load_state_dict(ckpt['model_state_dict'])
 
     metrics = evaluate_real(
@@ -63,6 +66,7 @@ def main():
         extra_sample_ratios=args.extra_sample_ratios,
         extra_sample_seed=args.extra_sample_seed,
         verbose=args.verbose,
+        input_channels=input_channels,
     )
 
     # r@500 only carries new info when extras inflate the detection pool

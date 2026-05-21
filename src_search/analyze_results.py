@@ -19,6 +19,20 @@ import os
 REQUIRED_FILES = ('params.json', 'summary.json', 'epoch_log.jsonl')
 
 
+def _overrides_str(t):
+    """Combined display string for PSF dims + trainer_dims overrides.
+
+    Format: PSF overrides as-is; trainer overrides (if any) tagged with
+    [trainer] so the source of each parameter stays unambiguous.
+    """
+    parts = []
+    if t.get('overrides'):
+        parts.append(str(t['overrides']))
+    if t.get('trainer_overrides'):
+        parts.append(f"[trainer] {t['trainer_overrides']}")
+    return '  '.join(parts) if parts else '{}'
+
+
 def _match_info(pd):
     """Return matched detection info or None if no match.
 
@@ -90,6 +104,8 @@ def load_trial(trial_dir):
         'trial_id': params['trial_id'],
         'name': os.path.basename(trial_dir),
         'overrides': params['overrides'],
+        # Older trials (pre trainer_dims) won't have this key — default to {}
+        'trainer_overrides': params.get('trainer_overrides', {}),
         'best_metric': summary.get('best_metric') if summary.get('best_metric') is not None else -1.0,
         'best_epoch': best_epoch,
         'main_metric': summary.get('main_metric', 'recall@50'),
@@ -140,7 +156,7 @@ def print_leaderboard(trials):
     for t in sorted_trials:
         print(f'{t["name"]:{name_w}}  {t["best_metric"]:>7.3f}  '
               f'{(t["best_epoch"] or 0) + 1:>5}  {t["epochs_run"]:>10}  '
-              f'{t["overrides"]}')
+              f'{_overrides_str(t)}')
     return sorted_trials
 
 
@@ -231,7 +247,7 @@ def print_single_yaml_breakdown(sorted_trials, rank_table):
 
     print(f'\n=== Single best yaml: {name}  '
           f'(leaderboard #1, {metric}={best_trial["best_metric"]:.3f}) ===')
-    print(f'  {best_trial["overrides"]}')
+    print(f'  {_overrides_str(best_trial)}')
 
     groups = [
         ('Strong  (rank<=30) ', lambda r: r is not None and r <= 30),
@@ -272,12 +288,12 @@ def print_best_yaml_per_defect(sorted_trials):
             if info is None:
                 continue
             if best is None or info['global_rank'] < best['global_rank']:
-                best = {**info, 'trial': t['name'], 'overrides': t['overrides']}
+                best = {**info, 'trial': t['name'], 'overrides_str': _overrides_str(t)}
         if best:
             print(f'  {d}: {best["trial"]}  '
                   f'rank={best["global_rank"]:>3d}/{best["n_total"]}  '
                   f'(local={best["local_rank"]}, score={best["score"]:.3f})  '
-                  f'{best["overrides"]}')
+                  f'{best["overrides_str"]}')
         else:
             print(f'  {d}: not matched in any trial')
 
@@ -331,7 +347,7 @@ def quality_weighted_greedy(sorted_trials, rank_table, k=3):
             b4 = sum(1 for r in ranks if r is None)
             print(f'\n  {step+1}. [BASE]  {best_t["name"]}  '
                   f'quality={sum(best_new_q.values()):.1f}/{float(n):.1f}')
-            print(f'        {best_t["overrides"]}')
+            print(f'        {_overrides_str(best_t)}')
             print(f'        {b1} top-30, {b2} mid (31-50), '
                   f'{b3} weak (51-150), {b4} miss')
         else:
@@ -347,7 +363,7 @@ def quality_weighted_greedy(sorted_trials, rank_table, k=3):
 
             print(f'\n  {step+1}. [+{best_gain:.1f}]  {best_t["name"]}  '
                   f'quality={sum(best_new_q.values()):.1f}/{float(n):.1f}')
-            print(f'        {best_t["overrides"]}')
+            print(f'        {_overrides_str(best_t)}')
             print(f'        Unique tier improvements over current ensemble:')
             if improvements:
                 for d, old, new, gain in improvements:
@@ -539,7 +555,7 @@ def print_dominance(sorted_trials, rank_table):
     print('\n=== Trial dominance (best source per defect) ===')
     for t in sorted_trials:
         c = counts[t['name']]
-        print(f'  {t["name"]}: dominant for {c}/{n} defects  {t["overrides"]}')
+        print(f'  {t["name"]}: dominant for {c}/{n} defects  {_overrides_str(t)}')
     if no_match:
         print(f'  no trial caught: {no_match}/{n}')
 

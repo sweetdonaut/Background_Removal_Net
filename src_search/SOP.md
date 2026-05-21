@@ -97,6 +97,67 @@ python src_search/run_eval.py \
     --extra_sample_ratios 0.1
 ```
 
+### Input channels（DoE：換模型輸入組合）
+
+預設輸入是 raw 3 通道 `target ref1 ref2`。有兩種設定方式：
+
+**方式 1：全部 trial 固定一種組合** — 用 `INPUT_CHANNELS` env var：
+
+```bash
+INPUT_CHANNELS="double_det" bash src_search/submit_search.sh ...
+INPUT_CHANNELS="target double_det" bash src_search/submit_search.sh ...
+INPUT_CHANNELS="target diff1 diff2 double_det" bash src_search/submit_search.sh ...
+```
+
+**方式 2：把它當搜尋維度** — 在 spec yaml 用 `trainer_dims:`（每個 trial 抽不同組合）：
+
+```yaml
+description: "Search input_channels"
+base_yaml: src_core/defects/small_spot_match_test.yaml
+
+dims:
+  intensity_abs:
+    type: range_pair
+    low:   {min: 60, max: 70}
+    width: {min: 10, max: 20}
+
+trainer_dims:
+  input_channels:
+    type: categorical
+    values:
+      - [target, ref1, ref2]
+      - [double_det]
+      - [target, double_det]
+      - [target, diff1, diff2, double_det]
+```
+
+可選通道：`target` `ref1` `ref2` `diff1` `diff2` `double_det`
+（`diff{i}=target-ref{i}`，`double_det=sign-consistent min(|diff1|,|diff2|)`）
+
+每個 trial 的 checkpoint 自動存 `input_channels`，`run_eval.py` 會讀回來組對應的 input。
+**舊 checkpoint 沒這個 key 時 fallback 預設 3 通道，向後相容。**
+
+### PSF scalar params（pixel_oversample 等）
+
+PSF yaml 裡的 scalar key（不是 `[a, b]` pair）也能搜，例如 `pixel_oversample`：
+
+```yaml
+dims:
+  pixel_oversample:
+    type: categorical                # 從固定 list 抽
+    values: [1, 2, 4, 8]
+
+  # 或用連續範圍：
+  # psf_size:
+  #   type: scalar                   # 單一值，不是 pair
+  #   range: {min: 128, max: 512}
+  #   decimals: 0                    # 0 -> int
+```
+
+`scalar` 跟 `scalar_pair` 的差別：前者寫進 yaml 是 `key: 4`，後者是 `key: [4, 4]`。
+`pixel_oversample` 是純 scalar，要用 `scalar` 或 `categorical`。
+`outer_r`、`brightness` 這類 `[a, b]` pair 用 `scalar_pair`。
+
 ### Dead pixel mask（CCD 永久亮點）
 
 CCD 有固定亮點時，會在 heatmap 上產生永久 FP，把真正的 defect 從 top-150 擠出去。

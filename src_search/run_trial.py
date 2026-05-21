@@ -21,7 +21,8 @@ sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(os.path.dirname(HERE), 'src_core'))
 
 from generate_psf import load_config as load_psf_config  # noqa: E402
-from search_space import build_overrides, load_spec, resolve_base_yaml  # noqa: E402
+from search_space import (build_overrides, build_trainer_overrides,  # noqa: E402
+                          load_spec, resolve_base_yaml)
 from search_trainer import build_parser, train  # noqa: E402
 
 PROJECT_ROOT = os.path.dirname(HERE)
@@ -72,6 +73,10 @@ def main():
     parser.add_argument('--partial_leak_scale', type=float, nargs=2, default=[0.0, 0.0])
     parser.add_argument('--gamma_start', type=float, default=2.0)
     parser.add_argument('--gamma_end', type=float, default=2.0)
+    parser.add_argument('--input_channels', type=str, nargs='+',
+                        default=['target', 'ref1', 'ref2'],
+                        help='Ordered subset of {target, ref1, ref2, diff1, '
+                             'diff2, double_det}. Passed through to search_trainer.')
     args = parser.parse_args()
 
     trial_dir = os.path.join(args.output_root, f'trial_{args.trial_id:03d}')
@@ -82,6 +87,11 @@ def main():
 
     rng = np.random.default_rng(args.seed)
     overrides = build_overrides(spec, rng)
+    trainer_overrides = build_trainer_overrides(spec, rng)
+
+    # trainer_dims override the CLI defaults. Currently supported keys:
+    #   input_channels (list of channel names)
+    input_channels = trainer_overrides.get('input_channels', args.input_channels)
 
     trial_yaml_path = os.path.join(trial_dir, 'trial_yaml.yaml')
     write_trial_yaml(base_yaml_path, overrides, trial_yaml_path)
@@ -93,10 +103,13 @@ def main():
             'search_spec': os.path.abspath(args.search_spec),
             'base_yaml': base_yaml_path,
             'overrides': overrides,
+            'trainer_overrides': trainer_overrides,
         }, f, indent=2)
 
     print(f'\n=== Trial {args.trial_id} (seed={args.seed}) ===')
     print(f'overrides: {overrides}')
+    if trainer_overrides:
+        print(f'trainer_overrides: {trainer_overrides}')
     print(f'trial_dir: {trial_dir}\n')
 
     trainer_argv = [
@@ -128,6 +141,7 @@ def main():
         '--early_stop_patience', str(args.early_stop_patience),
         '--seed', str(args.seed),
         '--dead_pixel_half_size', str(args.dead_pixel_half_size),
+        '--input_channels', *input_channels,
     ]
     if args.dead_pixel_csv:
         trainer_argv += ['--dead_pixel_csv', args.dead_pixel_csv]

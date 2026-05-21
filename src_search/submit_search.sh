@@ -90,6 +90,14 @@ EXTRA_TEST_DIRS=${EXTRA_TEST_DIRS:-}
 EXTRA_SAMPLE_RATIOS=${EXTRA_SAMPLE_RATIOS:-}
 EXTRA_SAMPLE_SEED=${EXTRA_SAMPLE_SEED:-0}
 
+# Model input channels (space-separated). Default = baseline 3-channel raw.
+# Examples:
+#   INPUT_CHANNELS="double_det"                       # minimal DD-only
+#   INPUT_CHANNELS="target double_det"                # raw target + DD hint
+#   INPUT_CHANNELS="target diff1 diff2 double_det"    # full diff bundle
+# Allowed names: target ref1 ref2 diff1 diff2 double_det
+INPUT_CHANNELS=${INPUT_CHANNELS:-"target ref1 ref2"}
+
 mkdir -p "$OUTPUT_ROOT"
 
 # Snapshot spec into output_root so this batch's search space is preserved
@@ -111,6 +119,7 @@ if [ -n "$EXTRA_TEST_DIRS" ]; then
     echo "  extra ratios : $EXTRA_SAMPLE_RATIOS"
     echo "  extra seed   : $EXTRA_SAMPLE_SEED"
 fi
+echo "  input chans  : $INPUT_CHANNELS"
 
 DEAD_PIXEL_FLAG=""
 if [ -n "$DEAD_PIXEL_CSV" ]; then
@@ -150,6 +159,7 @@ for i in $(seq 1 $N_TRIALS); do
         --training_dataset_path "$TRAINING_DATASET_PATH" \
         --match_radius "$MATCH_RADIUS" \
         --seed $((i * 1000 + 42)) \
+        --input_channels $INPUT_CHANNELS \
         $DEAD_PIXEL_FLAG \
         $EXTRA_FLAGS \
         2>&1 | tee "$TRIAL_DIR/trial.log"

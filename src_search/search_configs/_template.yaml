@@ -2,14 +2,24 @@
 # want to search this run. Two parallel runs (different output_roots, different
 # spec files) do not interfere because spec is per-run input data.
 #
-# Two sampler types are available:
+# Available sampler types:
 #   scalar_pair  -> samples one v in range, emits [v, v]
 #                   (used for outer_r, brightness, gaussian_sigma, all
 #                    Zernike aberrations, aperture geometry)
 #   range_pair   -> samples low + width, emits [[low, low+width]]
 #                   (used for intensity_abs)
+#   scalar       -> samples one v in range, emits v (not a pair)
+#                   (used for scalar yaml keys like pixel_oversample)
+#   categorical  -> picks one entry uniformly from a fixed list
+#                   (used for discrete choices: pixel_oversample, pol_type,
+#                    or trainer_dims values like input_channels)
 #
 # `decimals` controls rounding: 0 -> python int, >=1 -> rounded float.
+#
+# Two override sections:
+#   dims         -> written into the trial PSF yaml (PSF-level search)
+#   trainer_dims -> passed as CLI flags to search_trainer (trainer-level
+#                   search; for parameters not in the PSF yaml)
 
 description: "TEMPLATE — copy and customize per run"
 base_yaml: src_core/defects/type4_vector.yaml
@@ -109,3 +119,21 @@ dims:
   #   type: scalar_pair
   #   range: {min: 0, max: 180}
   #   decimals: 0
+
+  # ============================================================
+  # Tier 4: sensor sampling (scalar values, not pairs)
+  # ============================================================
+
+  # pixel_oversample:                  # choose from a discrete set
+  #   type: categorical
+  #   values: [1, 2, 4, 8]
+
+# trainer_dims:  # CLI-level search (not written into the PSF yaml)
+#
+#   input_channels:
+#     type: categorical
+#     values:
+#       - [target, ref1, ref2]
+#       - [double_det]
+#       - [target, double_det]
+#       - [target, diff1, diff2, double_det]

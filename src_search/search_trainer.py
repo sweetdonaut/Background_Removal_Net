@@ -25,7 +25,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(HERE), 'src_core'))
 
 import json  # noqa: E402
 
-from dataloader import Dataset  # noqa: E402
+from dataloader import Dataset, SUPPORTED_CHANNELS  # noqa: E402
 from evaluator import evaluate_real, per_defect_summary  # noqa: E402
 from loss import FocalLoss  # noqa: E402
 from model import SegmentationNetwork  # noqa: E402
@@ -77,6 +77,7 @@ def build_dataloader(args, patch_size):
         psf_pool_workers=args.psf_pool_workers,
         partial_leak_prob=args.partial_leak_prob,
         partial_leak_scale=tuple(args.partial_leak_scale),
+        input_channels=args.input_channels,
     )
     dataloader = DataLoader(
         dataset, batch_size=args.bs, shuffle=True,
@@ -94,6 +95,7 @@ def save_best_checkpoint(model, args, patch_size, epoch, metric_value, all_metri
         'metric_name': args.main_metric,
         'metric_value': metric_value,
         'all_metrics': all_metrics,
+        'input_channels': list(args.input_channels),
     }
     out = os.path.join(args.checkpoint_path, f'{run_name}_best.pth')
     torch.save(ckpt, out)
@@ -112,7 +114,9 @@ def train(args):
     patch_size = (args.patch_size, args.patch_size)
     run_name = f'BgRemoval_search_lr{args.lr}_ep{args.epochs}_bs{args.bs}_{patch_size[0]}'
 
-    model = SegmentationNetwork(in_channels=3, out_channels=2).to(device)
+    in_channels = len(args.input_channels)
+    print(f'Input channels ({in_channels}): {args.input_channels}')
+    model = SegmentationNetwork(in_channels=in_channels, out_channels=2).to(device)
     model.apply(weights_init)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
@@ -172,6 +176,7 @@ def train(args):
                 extra_test_dirs=args.extra_test_dirs,
                 extra_sample_ratios=args.extra_sample_ratios,
                 extra_sample_seed=args.extra_sample_seed,
+                input_channels=args.input_channels,
             )
             scalar_metrics = {k: v for k, v in metrics.items() if k != 'per_image'}
             per_defect = per_defect_summary(metrics['per_image'])
@@ -292,6 +297,13 @@ def build_parser():
                         help='Seed for deterministic extra-dir sampling. '
                              'Fixed across trials so the FP pool is identical '
                              'for every trial in one search.')
+    parser.add_argument('--input_channels', type=str, nargs='+',
+                        default=['target', 'ref1', 'ref2'],
+                        choices=list(SUPPORTED_CHANNELS),
+                        help=f'Channels fed to the network. Any ordered subset '
+                             f'of {SUPPORTED_CHANNELS}. '
+                             f'diff1=target-ref1, diff2=target-ref2, '
+                             f'double_det=sign-consistent min(|diff1|,|diff2|).')
     return parser
 
 

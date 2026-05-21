@@ -25,7 +25,8 @@ import torch.nn.functional as F
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(PROJECT_ROOT, 'src_core'))
-from dataloader import calculate_positions, ensure_3ch, ensure_hwc  # noqa: E402
+from dataloader import (build_input_channels, calculate_positions,  # noqa: E402
+                        ensure_3ch, ensure_hwc)
 
 GT_PATTERN = re.compile(r'#(\d+),(\d+)\.tiff?$', re.IGNORECASE)
 
@@ -76,7 +77,8 @@ def apply_dead_pixel_mask(heatmap, dead_pixels, half_size=5, fill_value=0.0):
     return heatmap
 
 
-def sliding_window_heatmap(image, model, patch_size, device):
+def sliding_window_heatmap(image, model, patch_size, device,
+                           input_channels=('target', 'ref1', 'ref2')):
     """Average-stitch sliding window heatmap of P(class=1)."""
     h, w = image.shape[:2]
     patch_h, patch_w = patch_size
@@ -93,9 +95,13 @@ def sliding_window_heatmap(image, model, patch_size, device):
         for y in y_positions:
             for x in x_positions:
                 patch = image[y:y + patch_h, x:x + patch_w]
-                three = np.stack(
-                    [patch[:, :, 0], patch[:, :, 1], patch[:, :, 2]], axis=0)
-                tensor = torch.from_numpy(three).float().unsqueeze(0).to(device) / 255.0
+                net_input = build_input_channels(
+                    patch[:, :, 0].astype(np.float32),
+                    patch[:, :, 1].astype(np.float32),
+                    patch[:, :, 2].astype(np.float32),
+                    input_channels,
+                )
+                tensor = torch.from_numpy(net_input).unsqueeze(0).to(device)
                 logits = model(tensor)
                 probs = F.softmax(logits, dim=1)
                 patch_score = probs[0, 1].cpu().numpy()
@@ -323,6 +329,7 @@ def evaluate_real(
     extra_sample_ratios=None,
     extra_sample_seed=0,
     verbose=False,
+    input_channels=('target', 'ref1', 'ref2'),
 ):
     """Run model on test_dir, run production-style detection, return cross-image metrics.
 
@@ -366,7 +373,8 @@ def evaluate_real(
         gt_x, gt_y = gt
 
         image = load_test_image(path)
-        heatmap = sliding_window_heatmap(image, model, patch_size, device)
+        heatmap = sliding_window_heatmap(image, model, patch_size, device,
+                                         input_channels=input_channels)
         apply_dead_pixel_mask(heatmap, dead_pixels, half_size=dead_pixel_half_size)
         detections = detect_in_image(
             heatmap,
@@ -396,7 +404,8 @@ def evaluate_real(
 
     for path, source_dir in extra_paths:
         image = load_test_image(path)
-        heatmap = sliding_window_heatmap(image, model, patch_size, device)
+        heatmap = sliding_window_heatmap(image, model, patch_size, device,
+                                         input_channels=input_channels)
         apply_dead_pixel_mask(heatmap, dead_pixels, half_size=dead_pixel_half_size)
         detections = detect_in_image(
             heatmap,
