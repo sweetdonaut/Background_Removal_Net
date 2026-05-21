@@ -11,7 +11,8 @@ from sklearn.metrics import roc_auc_score
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 from model import SegmentationNetwork
-from dataloader import calculate_positions, ensure_hwc, ensure_3ch
+from dataloader import (calculate_positions, ensure_hwc, ensure_3ch,
+                        build_input_channels, sign_consistent_double_det)
 
 
 class InferenceDataset(Dataset):
@@ -65,7 +66,7 @@ class InferenceDataset(Dataset):
         }
 
 
-def sliding_window_inference(image, model, patch_size, device):
+def sliding_window_inference(image, model, patch_size, device, input_channels):
     h, w = image.shape[:2]
     patch_h, patch_w = patch_size
 
@@ -85,12 +86,16 @@ def sliding_window_inference(image, model, patch_size, device):
         for x_idx, x in enumerate(x_positions):
             patch = image[y:y+patch_h, x:x+patch_w]
 
-            three_channel = np.stack([patch[:,:,0], patch[:,:,1], patch[:,:,2]], axis=0)
-            three_channel_tensor = torch.from_numpy(three_channel).float() / 255.0
-            three_channel_tensor = three_channel_tensor.unsqueeze(0).to(device)
+            net_input = build_input_channels(
+                patch[:, :, 0].astype(np.float32),
+                patch[:, :, 1].astype(np.float32),
+                patch[:, :, 2].astype(np.float32),
+                input_channels,
+            )
+            input_tensor = torch.from_numpy(net_input).unsqueeze(0).to(device)
 
             with torch.no_grad():
-                output = model(three_channel_tensor)
+                output = model(input_tensor)
                 output_sm = F.softmax(output, dim=1)
                 patch_heatmap = output_sm[:, 1, :, :].squeeze().cpu().numpy()
 
@@ -171,9 +176,7 @@ def visualize_results(image, heatmap, output_path):
     ax5.set_title('Target - Ref2')
     ax5.axis('off')
 
-    abs_diff1 = np.abs(diff1)
-    abs_diff2 = np.abs(diff2)
-    double_detection = np.where(abs_diff1 <= abs_diff2, diff1, diff2)
+    double_detection = sign_consistent_double_det(diff1, diff2)
     ax6 = fig.add_subplot(gs[5])
     dd_abs_max = max(abs(double_detection.min()), abs(double_detection.max()), 1e-8)
     ax6.imshow(double_detection, cmap='gray', vmin=-dd_abs_max, vmax=dd_abs_max)
@@ -203,9 +206,7 @@ def visualize_point_cloud(image, heatmap, output_path):
     diff2 = target - ref2
     avg_diff = ((diff1 + diff2) / 2).flatten()
 
-    abs_diff1 = np.abs(diff1)
-    abs_diff2 = np.abs(diff2)
-    double_det = np.where(abs_diff1 <= abs_diff2, diff1, diff2).flatten()
+    double_det = sign_consistent_double_det(diff1, diff2).flatten()
     heatmap_flat = heatmap.flatten()
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
@@ -246,7 +247,11 @@ def inference(args):
     patch_size = (checkpoint['img_height'], checkpoint['img_width'])
     print(f"Model patch size: {patch_size}")
 
-    model = SegmentationNetwork(in_channels=3, out_channels=2)
+    input_channels = checkpoint.get('input_channels', ['target', 'ref1', 'ref2'])
+    in_channels = len(input_channels)
+    print(f"Input channels ({in_channels}): {input_channels}")
+
+    model = SegmentationNetwork(in_channels=in_channels, out_channels=2)
     model.load_state_dict(checkpoint['model_state_dict'])
     model.to(device)
     model.eval()
@@ -268,7 +273,7 @@ def inference(args):
         img_path = sample['image_path'][0]
 
         heatmap, processed_image = sliding_window_inference(
-            image, model, patch_size, device
+            image, model, patch_size, device, input_channels
         )
 
         filename = os.path.basename(img_path).split('.')[0]

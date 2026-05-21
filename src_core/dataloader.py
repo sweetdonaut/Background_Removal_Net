@@ -49,6 +49,71 @@ def list_s3_objects(bucket, prefix, img_format):
     return [f's3://{bucket}/{k}' for k in sorted(keys)]
 
 
+SUPPORTED_CHANNELS = ('target', 'ref1', 'ref2', 'diff1', 'diff2', 'double_det')
+
+# Pixel-magnitude floor for declaring a position a defect candidate. Defects
+# are injected with intensity_abs ~60-80, so 5 (~7% of peak) safely discards
+# PSF tails and bg noise without rejecting real signal.
+DEFECT_MIN_ABS_DIFF = 5.0
+
+
+def sign_consistent_double_det(d1, d2):
+    """Double detection that only fires when both diffs agree on sign.
+
+    For each pixel: take the diff with smaller absolute value when sign(d1)
+    equals sign(d2); otherwise return 0. This makes "we see the same kind
+    of deviation in both refs" the explicit rule, matching the ground-truth
+    mask criterion.
+    """
+    sign_match = np.sign(d1) == np.sign(d2)
+    abs_smaller = np.where(np.abs(d1) <= np.abs(d2), d1, d2)
+    return np.where(sign_match, abs_smaller, 0).astype(np.float32)
+
+
+def objective_defect_mask(target, ref1, ref2, min_abs_diff=DEFECT_MIN_ABS_DIFF):
+    """Ground-truth mask derived purely from the synthesized channels.
+
+    A pixel is a defect iff target-ref1 and target-ref2 are sign-consistent
+    AND min(|d1|, |d2|) exceeds min_abs_diff. No knowledge of how defects
+    were injected is used — the mask is a pure function of (target, ref1,
+    ref2), so it stays consistent with whatever input channels the model
+    receives.
+    """
+    d1 = target - ref1
+    d2 = target - ref2
+    sign_match = np.sign(d1) == np.sign(d2)
+    min_abs = np.minimum(np.abs(d1), np.abs(d2))
+    return (sign_match & (min_abs > min_abs_diff)).astype(np.float32)
+
+
+def build_input_channels(target, ref1, ref2, channel_names):
+    """Assemble model input from raw target/ref1/ref2.
+
+    target, ref1, ref2: 2-D float arrays, expected in [0, 255].
+    channel_names: ordered list of names from SUPPORTED_CHANNELS.
+
+    Returns (C, H, W) float32 array; every channel divided by 255 so raw
+    channels land in [0, 1] and diff channels in [-1, 1].
+    """
+    d1 = target - ref1
+    d2 = target - ref2
+    table = {
+        'target':     target,
+        'ref1':       ref1,
+        'ref2':       ref2,
+        'diff1':      d1,
+        'diff2':      d2,
+        'double_det': sign_consistent_double_det(d1, d2),
+    }
+    out = []
+    for name in channel_names:
+        if name not in table:
+            raise ValueError(
+                f"Unknown input channel {name!r}. Supported: {SUPPORTED_CHANNELS}")
+        out.append(table[name] / 255.0)
+    return np.stack(out, axis=0).astype(np.float32)
+
+
 def ensure_hwc(image):
     """Auto-detect and convert CHW to HWC if needed."""
     if len(image.shape) == 3 and image.shape[0] in (3, 4) and image.shape[1] > 4 and image.shape[2] > 4:
@@ -281,7 +346,8 @@ class Dataset(Dataset):
                  psf_pool_workers=4,
                  intensity_abs=(60, 80),
                  partial_leak_prob=0.0,
-                 partial_leak_scale=(0.0, 0.0)):
+                 partial_leak_scale=(0.0, 0.0),
+                 input_channels=('target', 'ref1', 'ref2')):
         self.patch_size = patch_size
         self.num_defects_range = num_defects_range
         self.img_format = img_format
@@ -290,6 +356,11 @@ class Dataset(Dataset):
         self.intensity_abs = intensity_abs
         self.partial_leak_prob = partial_leak_prob
         self.partial_leak_scale = partial_leak_scale
+        self.input_channels = list(input_channels)
+        for n in self.input_channels:
+            if n not in SUPPORTED_CHANNELS:
+                raise ValueError(
+                    f"Unknown input channel {n!r}. Supported: {SUPPORTED_CHANNELS}")
 
         if defect_mode == 'psf':
             if not psf_config_paths:
@@ -472,16 +543,15 @@ class Dataset(Dataset):
         target, ref1, ref2, gt_mask = self.generate_defect_images_on_channels(
             target_channel, ref1_channel, ref2_channel
         )
-        
-        # Stack as 3-channel input
-        three_channel = np.stack([target, ref1, ref2], axis=0)  # (3, H, W)
-        
-        # Convert to torch tensors
-        three_channel_tensor = torch.from_numpy(three_channel).float() / 255.0
+
+        # Build whatever channel combination the trial asked for
+        net_input = build_input_channels(target, ref1, ref2, self.input_channels)
+
+        net_input_tensor = torch.from_numpy(net_input).float()
         gt_mask_tensor = torch.from_numpy(gt_mask).float().unsqueeze(0)  # (1, H, W)
-        
+
         return {
-            "three_channel_input": three_channel_tensor,
+            "three_channel_input": net_input_tensor,
             "target_mask": gt_mask_tensor
         }
     
@@ -523,11 +593,22 @@ class Dataset(Dataset):
         return None, None, None
 
     def generate_defect_images_on_channels(self, target_channel, ref1_channel, ref2_channel):
+        """Synthesize a 3-channel patch with mixed defect-channel allocations.
+
+        Ground-truth mask is computed objectively from the resulting
+        (target, ref1, ref2) via objective_defect_mask(): a pixel is a defect
+        iff diff1 and diff2 are sign-consistent and both above threshold.
+        Allocations below control what distribution of mask=1 / mask=0
+        regions a patch will contain, not the mask rule itself.
+        """
         h, w = target_channel.shape
 
-        if np.random.rand() >= 0.5:
-            gt_mask = np.zeros((h, w), dtype=np.float32)
-            return target_channel.copy(), ref1_channel.copy(), ref2_channel.copy(), gt_mask
+        # 10% of patches stay completely clean: preserves the image-level
+        # "no defect anywhere" prior.
+        if np.random.rand() < 0.1:
+            return (target_channel.copy(), ref1_channel.copy(),
+                    ref2_channel.copy(),
+                    np.zeros((h, w), dtype=np.float32))
 
         num_defects = np.random.randint(self.num_defects_range[0], self.num_defects_range[1] + 1)
 
@@ -537,42 +618,56 @@ class Dataset(Dataset):
             if local_defect is not None:
                 defects.append((local_defect, bounds, intensity))
 
-        if not defects:
-            gt_mask = np.zeros((h, w), dtype=np.float32)
-            return target_channel.copy(), ref1_channel.copy(), ref2_channel.copy(), gt_mask
+        if len(defects) < 2:
+            return (target_channel.copy(), ref1_channel.copy(),
+                    ref2_channel.copy(),
+                    np.zeros((h, w), dtype=np.float32))
 
         num_defects = len(defects)
         target = target_channel.copy()
         ref1 = ref1_channel.copy()
         ref2 = ref2_channel.copy()
 
-        # Allocation: ensure target-only defects for contrastive learning
-        num_target_only = np.random.randint(1, min(3, num_defects // 2 + 1))
-        target_only_ids = set(np.random.choice(num_defects, num_target_only, replace=False))
+        # Two positive-class sources for the objective mask:
+        #   target_only  (1,0,0)  -> diff1 = diff2 = +/-Δ  (sign-consistent)
+        #   both_refs    (0,1,1)  -> diff1 = diff2 = -/+Δ  (sign-consistent)
+        # Both yield mask=1 under the objective rule. Keeping both ensures
+        # the model sees the full positive distribution.
+        cap = max(1, min(3, num_defects // 2))
+        n_target_only = np.random.randint(1, cap + 1)
+        n_both_refs = np.random.randint(1, cap + 1)
+        while n_target_only + n_both_refs > num_defects:
+            if n_both_refs > 1:
+                n_both_refs -= 1
+            elif n_target_only > 1:
+                n_target_only -= 1
+            else:
+                break
 
-        remaining_ids = list(set(range(num_defects)) - target_only_ids)
+        all_ids = list(range(num_defects))
+        np.random.shuffle(all_ids)
+        target_only_ids = set(all_ids[:n_target_only])
+        both_refs_ids = set(all_ids[n_target_only:n_target_only + n_both_refs])
+
+        # Negative-class sources: (1,1,0)/(1,0,1)/(1,1,1) — all produce
+        # sign-mismatched or zero diffs at the defect location.
+        remaining_ids = all_ids[n_target_only + n_both_refs:]
         np.random.shuffle(remaining_ids)
-
         only_ref1_ids = set()
         only_ref2_ids = set()
-
-        if len(remaining_ids) >= 2:
-            n_remaining = len(remaining_ids)
-            n_only_ref1 = n_remaining // 3
-            n_only_ref2 = n_remaining // 3
+        all_three_ids = set()
+        if remaining_ids:
+            n_rem = len(remaining_ids)
+            n_only_ref1 = n_rem // 3
+            n_only_ref2 = n_rem // 3
             only_ref1_ids = set(remaining_ids[:n_only_ref1])
             only_ref2_ids = set(remaining_ids[n_only_ref1:n_only_ref1 + n_only_ref2])
-        elif len(remaining_ids) == 1:
-            if np.random.rand() < 0.5:
-                only_ref1_ids = set(remaining_ids)
-            else:
-                only_ref2_ids = set(remaining_ids)
+            all_three_ids = set(remaining_ids[n_only_ref1 + n_only_ref2:])
 
-        remove_ref1 = target_only_ids | only_ref2_ids
-        remove_ref2 = target_only_ids | only_ref1_ids
-
-        # Partial leak: each target-only defect may also appear at reduced
-        # intensity in one ref. Mask still labels it as a defect.
+        # Partial leak: target_only defects may bleed into one ref at
+        # reduced intensity. With the objective mask this no longer needs
+        # special-casing — the leaked pixel automatically lands in mask=1
+        # if min(|d1|,|d2|) still clears the threshold, else mask=0.
         leak_to_ref1 = {}
         leak_to_ref2 = {}
         for tid in target_only_ids:
@@ -583,25 +678,29 @@ class Dataset(Dataset):
                 else:
                     leak_to_ref2[tid] = scale
 
-        gt_mask = np.zeros((h, w), dtype=np.float32)
-
         for i, (local_defect, bounds, intensity) in enumerate(defects):
-            target = apply_local_defect_to_background(target, local_defect, bounds, intensity)
-            if i not in remove_ref1:
+            apply_target = (i in target_only_ids or i in only_ref1_ids
+                            or i in only_ref2_ids or i in all_three_ids)
+            apply_ref1 = (i in only_ref1_ids or i in all_three_ids
+                          or i in both_refs_ids)
+            apply_ref2 = (i in only_ref2_ids or i in all_three_ids
+                          or i in both_refs_ids)
+
+            if apply_target:
+                target = apply_local_defect_to_background(target, local_defect, bounds, intensity)
+
+            if apply_ref1:
                 ref1 = apply_local_defect_to_background(ref1, local_defect, bounds, intensity)
             elif i in leak_to_ref1:
                 ref1 = apply_local_defect_to_background(
                     ref1, local_defect, bounds, intensity * leak_to_ref1[i])
-            if i not in remove_ref2:
+
+            if apply_ref2:
                 ref2 = apply_local_defect_to_background(ref2, local_defect, bounds, intensity)
             elif i in leak_to_ref2:
                 ref2 = apply_local_defect_to_background(
                     ref2, local_defect, bounds, intensity * leak_to_ref2[i])
-            if i in target_only_ids:
-                local_mask = create_binary_mask(local_defect, threshold=0.1)
-                y_start, y_end, x_start, x_end = bounds
-                gt_mask[y_start:y_end, x_start:x_end] = np.maximum(
-                    gt_mask[y_start:y_end, x_start:x_end], local_mask
-                )
+
+        gt_mask = objective_defect_mask(target, ref1, ref2)
 
         return target, ref1, ref2, gt_mask

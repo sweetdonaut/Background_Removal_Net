@@ -13,7 +13,9 @@ import matplotlib.pyplot as plt
 from sklearn.metrics import roc_auc_score
 from loss import FocalLoss
 from model import SegmentationNetwork
-from dataloader import Dataset, sample_magnitude, calculate_positions, ensure_hwc, ensure_3ch
+from dataloader import (Dataset, sample_magnitude, calculate_positions,
+                        ensure_hwc, ensure_3ch, build_input_channels,
+                        SUPPORTED_CHANNELS)
 
 
 def _render_defect_grid(defects, out_path, suptitle=None):
@@ -119,7 +121,8 @@ def get_focal_gamma(epoch, total_epochs, gamma_start, gamma_end, schedule='cosin
         raise ValueError(f"Unknown schedule: {schedule}")
     return gamma
 
-def evaluate_model(model, valid_root, ground_truth_root, img_format, patch_size, device):
+def evaluate_model(model, valid_root, ground_truth_root, img_format, patch_size, device,
+                   input_channels=('target', 'ref1', 'ref2')):
     model.eval()
 
     all_scores = []
@@ -177,10 +180,15 @@ def evaluate_model(model, valid_root, ground_truth_root, img_format, patch_size,
                     for x in x_positions:
                         # Extract patch
                         patch = image[y:y+patch_size[0], x:x+patch_size[1]]
-                        
-                        # Prepare input tensor
-                        input_tensor = torch.from_numpy(patch).permute(2, 0, 1).float() / 255.0
-                        input_tensor = input_tensor.unsqueeze(0).to(device)
+
+                        # Build configured channels and prepare input tensor
+                        net_input = build_input_channels(
+                            patch[:, :, 0].astype(np.float32),
+                            patch[:, :, 1].astype(np.float32),
+                            patch[:, :, 2].astype(np.float32),
+                            input_channels,
+                        )
+                        input_tensor = torch.from_numpy(net_input).unsqueeze(0).to(device)
                         
                         # Forward pass
                         output = model(input_tensor)
@@ -283,9 +291,10 @@ def train_on_device(args):
     patch_size = (args.patch_size, args.patch_size)
 
     run_name = f'BgRemoval_lr{args.lr}_ep{args.epochs}_bs{args.bs}_{patch_size[0]}x{patch_size[1]}'
-    
-    # Single segmentation network for 3-channel input
-    model_seg = SegmentationNetwork(in_channels=3, out_channels=2)
+
+    in_channels = len(args.input_channels)
+    print(f"Input channels ({in_channels}): {args.input_channels}")
+    model_seg = SegmentationNetwork(in_channels=in_channels, out_channels=2)
     model_seg.to(device)
     model_seg.apply(weights_init)
     
@@ -317,6 +326,7 @@ def train_on_device(args):
         psf_pool_size=args.psf_pool_size,
         partial_leak_prob=args.partial_leak_prob,
         partial_leak_scale=tuple(args.partial_leak_scale),
+        input_channels=args.input_channels,
     )
     
     dataloader = DataLoader(dataset, batch_size=args.bs, shuffle=True,
@@ -377,7 +387,8 @@ def train_on_device(args):
             if os.path.exists(valid_root):
                 image_auroc, pixel_auroc = evaluate_model(
                     model_seg, valid_root, ground_truth_root,
-                    args.img_format, patch_size, device
+                    args.img_format, patch_size, device,
+                    input_channels=args.input_channels,
                 )
                 print(f' - Image AUROC: {image_auroc:.4f} - Pixel AUROC: {pixel_auroc:.4f}')
             else:
@@ -391,7 +402,8 @@ def train_on_device(args):
             'img_height': patch_size[0],
             'img_width': patch_size[1],
             'epoch': epoch,
-            'seed': args.seed
+            'seed': args.seed,
+            'input_channels': list(args.input_channels),
         }
         torch.save(checkpoint, os.path.join(args.checkpoint_path, f'{run_name}.pth'))
 
@@ -437,6 +449,12 @@ def main():
                         metavar=('MIN', 'MAX'),
                         help='Range of intensity scale when a target-only defect leaks to a ref '
                              '(default: 0.0 0.0 — disabled).')
+    parser.add_argument('--input_channels', type=str, nargs='+',
+                        default=['target', 'ref1', 'ref2'],
+                        choices=list(SUPPORTED_CHANNELS),
+                        help=f'Channels to feed the network. Pick any ordered subset of '
+                             f'{SUPPORTED_CHANNELS}. diff1=target-ref1, diff2=target-ref2, '
+                             f'double_det=sign-preserving min(|diff1|,|diff2|).')
 
     args = parser.parse_args()
     
