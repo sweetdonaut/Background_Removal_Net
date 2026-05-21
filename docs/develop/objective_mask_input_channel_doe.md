@@ -1,6 +1,8 @@
 # 客觀 Mask + 可配置 Input Channels 實驗紀錄
 
 > ⚠️ **本次改動 aggressive，正式套用到 production 前請完整閱讀第 6 節「生產環境套用清單」**
+>
+> 🛑 **Production 反饋（後續修正）**：客觀 mask 把 (0,1,1) 當 positive 在生產環境造成大量 FP；mask 規則已退回 v1 風格（plan A'，見第 9 節）。本文件第 1~8 節保留作為實驗紀錄，但目前 dataloader 行為以第 9 節為準。
 
 ---
 
@@ -336,6 +338,72 @@ python utils/summarize_doe.py
 
 ---
 
-## 8. 一句話結論
+## 8. 一句話結論（合成階段）
 
 **Mask 改成 `(target, ref1, ref2)` 的純客觀函數後，「(0,1,1) 對稱盲點」從問題定義裡消失了；後續 DoE 顯示 `dd_minimal` 在合成測試上表現最好，但 production 套用前需逐項通過第 6 節檢查清單。**
+
+---
+
+## 9. Production 反饋與 Plan A' 修正
+
+### 9.1 Production 觀察
+
+生產環境實測發現：依第 7 節結論訓練出的模型（特別是 dd_minimal）在真實影像上**對 (0,1,1) 模式產生大量 FP**。Refs 之間 sign-consistent 但 target 乾淨的事件在 production 上**非常密集**，模型把它們全部當 defect 報出來。
+
+### 9.2 Root cause
+
+合成測試的 (0,1,1)（手動注入兩張 ref 同強度 PSF，pixel-perfect 對齊）跟 production 上的 (0,1,1)（emergent，從 ref 之間的對位殘餘、感測器 fixed-pattern、暫態粒子、照明 drift 等自然產生）**分布差太多**：
+
+- 合成版：強訊號（intensity ±60~80）、形狀規則、稀少
+- Production 版：強度範圍寬、形狀雜亂、**事件密度高**
+
+客觀 mask 規則對所有 sign-consistent diff 一視同仁，模型在 production 上學成「**任何 sign-consistent diff 都報**」→ FP 爆炸。
+
+更深層的問題：production 的 defect 偵測任務本質是 **asymmetric**（「target 上有 anomaly」），第 1.4 節用 sign-consistent diff 當客觀判準時把它變 symmetric 了。
+
+### 9.3 Plan A'：被動式處理 (0,1,1)
+
+新策略：
+- **不主動注入 (0,1,1)**——避免合成 vs 真實 distribution 不一致誤導模型
+- **mask 規則回到 `target_only_ids` 綁定**——「target 上有 anomaly」回到唯一 positive 條件
+- 假設：good/ 訓練影像本身已含真實 ref-side noise，模型會從這些 patch 自然吸收「常見背景偽訊號不報」
+
+### 9.4 改動
+
+`src_core/dataloader.py`：
+
+| 項目 | 變化 |
+|---|---|
+| `objective_defect_mask`, `DEFECT_MIN_ABS_DIFF` | **移除**（dead code） |
+| `sign_consistent_double_det` | 保留（仍是 `double_det` input channel 與 visualize 用） |
+| `generate_defect_images_on_channels` | 重寫：移除 Tier 1 (0,1,1) 強制；mask 改回 `target_only_ids` 綁定（用 `create_binary_mask`）；其餘配額邏輯沿用 v1 風格 |
+| Tier 結構 | 每 patch 仍強制 ≥1 顆 (1,0,0)；剩餘三等分給 (1,1,0)/(1,0,1)/(1,1,1)；**(0,1,1) 不出現** |
+| 10% 整片乾淨 | 保留 |
+| Partial leak | 保留特殊處理（leaked target_only 仍 mask=1） |
+
+`src_core/inference.py`、`src_core/trainer.py`：**無變化**（input channel 配置框架、checkpoint 自動讀寫、視覺化皆無關 mask 規則）。
+
+### 9.5 已知 trade-off
+
+- (1,0,0) intensity = −Δ 與真實 (0,1,1) intensity = +Δ 在 diff 結構上對稱——這個 fundamental ambiguity 重新存在
+- 不含 target 通道的 input 配置（例如 `dd_minimal`）在 Plan A' 下**理論上無法區分**這兩種情境
+- 真實 production 上如果這兩者強度分布不重疊，仍可用 magnitude 區隔；若重疊則需限制 intensity 方向或重新設計
+
+### 9.6 SOP 影響
+
+- **訓練 SOP（第 4 節）**：指令不變
+- **合成測試集 SOP（第 5 節）**：仍可用，但 **D_both_refs (0,1,1) 的期望 mask 從 1 變回 0**——通過標準調整：
+  - A (target_only)：peak ≥ 0.95
+  - **D (both_refs)：peak ≤ 0.05**（之前是 ≥ 0.95）
+  - B, C, E, F, G, H：peak ≤ 0.05
+- **生產環境清單（第 6 節）**：客觀 mask 警告已不適用，但「dd_minimal / diff_only 等無 target 通道配置可能有 ambiguity」這條風險仍在
+
+### 9.7 後續驗證項目
+
+1. 用 Plan A' 重訓 baseline / dd_minimal / target_dd，跑同樣 8 情境合成測試
+2. **拿一批 good/ 影像直接量化 sign-consistent noise 分布**（驗證「good/ 本身含真實 ref-side noise」這個 plan A' 的核心假設）
+3. Production 重測 FP 是否壓住
+
+### 9.8 文件版本
+
+第 1~8 節保留為實驗歷程紀錄，**第 9 節為現行行為的準據**。若未來再次調整 mask 規則，請新增第 10 節而非改寫前文。

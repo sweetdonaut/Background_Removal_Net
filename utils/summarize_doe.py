@@ -4,9 +4,9 @@ Each scenario folder under ROOT is run through every checkpoint; we report
 peak heatmap score inside a small window around the injected defect center,
 plus global max. H_clean has no injection so we report only global max.
 
-Expected outcome under the objective mask rule:
-  A (1,0,0), D (0,1,1) -> peak ≈ 1 (positive class)
-  B, C, E, F, G, H_clean -> peak ≈ 0 (negative class)
+Expected outcome under plan A' (target_only_ids mask):
+  A (1,0,0) -> peak ≈ 1 (positive class)
+  B, C, D, E, F, G, H_clean -> peak ≈ 0 (negative class)
 """
 import os
 import sys
@@ -30,9 +30,9 @@ CENTERS = [(88, 244), (88, 488), (88, 732), (88, 366)]  # cx, cy
 WINDOW = 8
 
 CHECKPOINTS = {
-    'baseline_v3': os.path.join(PROJECT_ROOT, 'checkpoints/baseline_v3/BgRemoval_lr0.001_ep20_bs16_128x128.pth'),
-    'dd_minimal':  os.path.join(PROJECT_ROOT, 'checkpoints/dd_minimal/BgRemoval_lr0.001_ep20_bs16_128x128.pth'),
-    'target_dd':   os.path.join(PROJECT_ROOT, 'checkpoints/target_dd/BgRemoval_lr0.001_ep20_bs16_128x128.pth'),
+    'baseline_v4':   os.path.join(PROJECT_ROOT, 'checkpoints/baseline_v4/BgRemoval_lr0.001_ep20_bs16_128x128.pth'),
+    'dd_minimal_v4': os.path.join(PROJECT_ROOT, 'checkpoints/dd_minimal_v4/BgRemoval_lr0.001_ep20_bs16_128x128.pth'),
+    'target_dd_v4':  os.path.join(PROJECT_ROOT, 'checkpoints/target_dd_v4/BgRemoval_lr0.001_ep20_bs16_128x128.pth'),
 }
 
 
@@ -121,8 +121,8 @@ def main():
     print()
     print('-' * (24 + 15 * len(rows)))
     for sc in scenarios:
-        # mark expected positive vs negative
-        expected = '+' if sc.startswith(('A_', 'D_')) else '-'
+        # mark expected positive vs negative (plan A': only A is positive)
+        expected = '+' if sc.startswith('A_') else '-'
         print(f"{expected} {sc:<22s}", end='')
         for r in rows:
             peak, gmax = r[sc]

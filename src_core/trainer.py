@@ -15,7 +15,9 @@ from loss import FocalLoss
 from model import SegmentationNetwork
 from dataloader import (Dataset, sample_magnitude, calculate_positions,
                         ensure_hwc, ensure_3ch, build_input_channels,
-                        SUPPORTED_CHANNELS)
+                        sign_consistent_double_det, SUPPORTED_CHANNELS)
+from gaussian import (apply_local_defect_to_background, create_binary_mask,
+                      create_local_gaussian_defect)
 
 
 def _render_defect_grid(defects, out_path, suptitle=None):
@@ -50,6 +52,135 @@ def _render_defect_grid(defects, out_path, suptitle=None):
     plt.savefig(out_path, dpi=120, bbox_inches='tight')
     plt.close()
     print(f"Saved defect examples: {out_path}")
+
+
+def _pick_demo_defect(dataset, viz_h, viz_w):
+    """Return (defect_kernel, bounds, intensity) for the in-context demo.
+
+    Deterministic-ish: picks the first PSF in the pool (PSF mode) or a
+    canonical 3x3 sigma=1.3 gaussian (gaussian mode), centered in the
+    visualization patch, fixed +intensity sampled from intensity_abs.
+    """
+    if dataset.defect_mode == 'psf':
+        defect = dataset.defect_pool.pools[0][0]
+        dh, dw = defect.shape
+        intensity_spec = dataset.defect_pool.cfgs[0].get(
+            'intensity_abs', dataset.intensity_abs)
+    else:
+        cx, cy = viz_w // 2, viz_h // 2
+        defect, _ = create_local_gaussian_defect(
+            center=(cx, cy), size=(3, 3), sigma=1.3,
+            patch_shape=(viz_h, viz_w), patch_offset=(0, 0))
+        if defect is None:
+            return None, None, None
+        dh, dw = defect.shape
+        intensity_spec = dataset.intensity_abs
+
+    # Place the defect at patch center
+    y0 = viz_h // 2 - dh // 2
+    x0 = viz_w // 2 - dw // 2
+    bounds = (y0, y0 + dh, x0, x0 + dw)
+    intensity = float(np.mean([sample_magnitude(intensity_spec) for _ in range(8)]))
+    return defect, bounds, intensity
+
+
+def _render_defect_in_context(dataset, out_path, viz_patch_size=64):
+    """Render 4 channel combinations applied to a real training patch.
+
+    Layout: 4 rows (combinations) x 7 cols
+        target, ref1, ref2, diff1, diff2, double_det, mask
+    Three colorbars on the right: grayscale 0-255 (raw channels), diverging
+    +/- intensity (diff/DD), hot 0-1 (mask). Mask is all-black except for
+    the (1,0,0) row to make the asymmetric ground-truth rule visually
+    explicit.
+    """
+    img_path = dataset.training_paths[0]
+    image = dataset._load_image(img_path)
+    if image is None:
+        print(f"Warning: failed to load demo image, skipping {out_path}")
+        return
+    image = ensure_3ch(ensure_hwc(image)).astype(np.float32)
+    mn, mx = image.min(), image.max()
+    if mn < 0 or mx > 255:
+        image = (image - mn) / max(mx - mn, 1e-8) * 255.0 if mx > mn else np.zeros_like(image)
+
+    H, W = image.shape[:2]
+    if H < viz_patch_size or W < viz_patch_size:
+        print(f"Warning: image too small for {viz_patch_size}x{viz_patch_size} demo, skipping")
+        return
+    cy0 = (H - viz_patch_size) // 2
+    cx0 = (W - viz_patch_size) // 2
+    base = image[cy0:cy0 + viz_patch_size, cx0:cx0 + viz_patch_size]
+    t0, r10, r20 = base[:, :, 0].copy(), base[:, :, 1].copy(), base[:, :, 2].copy()
+
+    defect, bounds, intensity = _pick_demo_defect(dataset, viz_patch_size, viz_patch_size)
+    if defect is None:
+        print(f"Warning: failed to build demo defect, skipping {out_path}")
+        return
+
+    # (label, apply_target, apply_ref1, apply_ref2, mask_is_positive)
+    scenarios = [
+        ('(1,0,0)\ntarget only',  True, False, False, True),
+        ('(1,1,0)\ntarget+ref1',  True, True,  False, False),
+        ('(1,0,1)\ntarget+ref2',  True, False, True,  False),
+        ('(1,1,1)\nall three',    True, True,  True,  False),
+    ]
+    diff_lim = max(80.0, intensity + 10.0)  # +/- range for diff/DD colormap
+
+    fig, axes = plt.subplots(4, 7, figsize=(16, 9))
+    fig.suptitle(
+        f'Defect-in-context (intensity=+{intensity:.0f}, '
+        f'{viz_patch_size}x{viz_patch_size} patch, defect bbox={defect.shape})',
+        fontsize=11, fontweight='bold')
+
+    for row, (label, apply_t, apply_r1, apply_r2, mask_pos) in enumerate(scenarios):
+        t = apply_local_defect_to_background(t0, defect, bounds, intensity) if apply_t else t0.copy()
+        r1 = apply_local_defect_to_background(r10, defect, bounds, intensity) if apply_r1 else r10.copy()
+        r2 = apply_local_defect_to_background(r20, defect, bounds, intensity) if apply_r2 else r20.copy()
+        d1 = t - r1
+        d2 = t - r2
+        dd = sign_consistent_double_det(d1, d2)
+        mask = np.zeros((viz_patch_size, viz_patch_size), dtype=np.float32)
+        if mask_pos:
+            y0, y1, x0, x1 = bounds
+            mask[y0:y1, x0:x1] = np.maximum(
+                mask[y0:y1, x0:x1], create_binary_mask(defect, threshold=0.1))
+
+        cols = [
+            (t,    'target',     'gray',   0, 255),
+            (r1,   'ref1',       'gray',   0, 255),
+            (r2,   'ref2',       'gray',   0, 255),
+            (d1,   'diff1',      'RdBu_r', -diff_lim, diff_lim),
+            (d2,   'diff2',      'RdBu_r', -diff_lim, diff_lim),
+            (dd,   'double_det', 'RdBu_r', -diff_lim, diff_lim),
+            (mask, 'mask',       'hot',    0, 1),
+        ]
+        for col, (img, name, cmap, vmin, vmax) in enumerate(cols):
+            ax = axes[row, col]
+            ax.imshow(img, cmap=cmap, vmin=vmin, vmax=vmax, interpolation='nearest')
+            if row == 0:
+                ax.set_title(name, fontsize=10)
+            if col == 0:
+                ax.set_ylabel(label, fontsize=9)
+            ax.set_xticks([]); ax.set_yticks([])
+
+    fig.subplots_adjust(right=0.82, top=0.92, hspace=0.05, wspace=0.05)
+    cax_gray = fig.add_axes([0.84, 0.10, 0.012, 0.78])
+    plt.colorbar(
+        plt.cm.ScalarMappable(norm=plt.Normalize(0, 255), cmap='gray'),
+        cax=cax_gray, label='pixel intensity (0-255)')
+    cax_diff = fig.add_axes([0.89, 0.10, 0.012, 0.78])
+    plt.colorbar(
+        plt.cm.ScalarMappable(norm=plt.Normalize(-diff_lim, diff_lim), cmap='RdBu_r'),
+        cax=cax_diff, label=f'diff / double_det (+/-{diff_lim:.0f})')
+    cax_mask = fig.add_axes([0.94, 0.10, 0.012, 0.78])
+    plt.colorbar(
+        plt.cm.ScalarMappable(norm=plt.Normalize(0, 1), cmap='hot'),
+        cax=cax_mask, label='mask')
+
+    plt.savefig(out_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"Saved defect-in-context: {out_path}")
 
 
 def save_training_artifacts(checkpoint_path, dataset, psf_config_paths, n_patches=15):
@@ -92,6 +223,9 @@ def save_training_artifacts(checkpoint_path, dataset, psf_config_paths, n_patche
             attempts += 1
         out = os.path.join(checkpoint_path, 'defect_examples.png')
         _render_defect_grid(defects, out)
+
+    _render_defect_in_context(
+        dataset, os.path.join(checkpoint_path, 'defect_in_context.png'))
 
     np.random.set_state(state)
 
